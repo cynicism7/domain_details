@@ -1,0 +1,21 @@
+# 文献领域识别 - 依赖
+
+# 配置
+pyyaml>=6.0
+
+# PDF 渲染 + OCR（本项目对 PDF 强制走 OCR）
+pymupdf>=1.26.0
+paddlepaddle>=2.6.0
+paddleocr>=2.9.0
+opencv-python-headless>=4.10.0
+
+# 其他格式（可选）
+pypdf>=4.0.0
+python-docx>=1.1.0
+
+# 本地大模型调用（Ollama 或 OpenAI 兼容 API）
+requests>=2.31.0
+ollama>=0.3.0
+
+# LM Studio（OpenAI 兼容 API）
+openai>=1.0.0

@@ -1,0 +1,20 @@
+literature_dirs:
+  - "./papers"
+extensions:
+  - ".pdf"
+llm:
+  provider: "openai_api"
+  model: "Qwen2.5-VL-7B-Instruct"
+  api_base: "http://127.0.0.1:1234/v1"
+  api_key: "lm-studio"
+  # 思考型模型易把 token 耗在 <think> 里导致截断：可增大 max_tokens（如 1024）或换用非思考型小模型（如 Qwen2.5-7B）提速且更稳
+  max_tokens: 512
+  temperature: 0.0
+  # 可选：自定义 system_prompt，不填则用内置提示（约束模型不要 <think>、直接输出 JSON）
+  # system_prompt: "你是分类器。禁止 <think>，只输出一行 {\"field\": \"学科名称\"}。"
+# 送交的文献内容上限（仅标题/作者/研究团队/摘要），越小越快
+max_chars_for_llm: 800
+output:
+  db_path: "./literature_domains.db"
+  export_csv: True
+  csv_path: "./literature_domains.csv"
