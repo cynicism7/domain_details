@@ -100,6 +100,7 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
             max_tokens=llm_cfg.get("max_tokens", 256),
             temperature=llm_cfg.get("temperature", 0.0),
             system_prompt=llm_cfg.get("system_prompt"),
+            preferred_domains=cfg.get("preferred_domains"),
         )
         upsert_domain(conn, fp, domain_cn, domain_en)
         print(f"{domain_cn} | {domain_en}")

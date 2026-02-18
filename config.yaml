@@ -12,6 +12,14 @@ llm:
   temperature: 0.0
   # 可选：自定义 system_prompt，不填则用内置提示（约束模型不要 <think>、直接输出 JSON）
   # system_prompt: "你是分类器。禁止 <think>，只输出一行 {\"field\": \"学科名称\"}。"
+# 可选：优先让 AI 从以下领域中选择，不贴近再自拟。不填则使用程序内置列表
+# preferred_domains:
+#   - 细胞生物学
+#   - 分子生物学
+#   - 免疫学
+#   - 肿瘤学
+#   - 公共卫生
+#   - ...
 # 送交的文献内容上限（仅标题/作者/研究团队/摘要），越小越快
 max_chars_for_llm: 800
 output:

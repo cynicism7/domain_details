@@ -89,6 +89,14 @@ import json
 DEFAULT_SYSTEM_PROMPT = """你是文献领域分类器。本任务只需从给定内容判断一个学科名称，无需推理过程。
 禁止使用 <think> 或任何思考标签，不要输出解释，直接只输出一行 JSON：{"field": "学科名称"}。"""
 
+# 基础领域列表：优先让 AI 从此列表中选择；若不贴近再自行生成
+PREFERRED_DOMAINS = [
+    "细胞生物学", "分子生物学", "免疫学", "肿瘤学", "癌症生物学", "干细胞生物学", "发育生物学",
+    "药理学", "毒理学", "再生医学", "组织工程", "疫苗学", "病毒学", "生物制药", "生物技术",
+    "体外受精", "生殖生物学", "培养肉", "合成生物学", "微生物学", "植物生物学", "神经科学",
+    "内分泌学", "代谢研究", "流行病学", "公共卫生",
+]
+
 
 def identify_domain(
     title: str,
@@ -101,12 +109,19 @@ def identify_domain(
     max_tokens: int = 512,
     temperature: float = 0.0,
     system_prompt: Optional[str] = None,
+    preferred_domains: Optional[list] = None,
 ) -> tuple[str, str]:
     """
     调用本地大模型识别文献最接近的最小领域，返回 (domain_cn, domain_en)。
     未分类或解析失败时会自动重试一次。system_prompt 可抑制思考型模型的 <think> 以提速并避免截断。
+    preferred_domains 为空时使用内置 PREFERRED_DOMAINS；AI 优先从该列表中选，不贴近再自拟。
     """
-    prompt = """判断下面文献的最接近最小领域（学科），只填一个中文名，如：计算机科学、生物信息学、材料科学、医学、化学、物理学等。
+    domains_list = preferred_domains if preferred_domains is not None else PREFERRED_DOMAINS
+    domains_str = "、".join(domains_list)
+
+    prompt = """判断下面文献的最接近最小领域（学科）。
+请优先从以下领域中选择最贴近的一项：%s
+若以上均不贴近，再自行给出一个学科名称。只输出一个中文名。
 直接输出一行 JSON，不要 <think>、不要解释：
 {"field": "学科名称"}
 
@@ -114,6 +129,7 @@ def identify_domain(
 
 【标题、作者、机构、摘要】
 %s""" % (
+        domains_str,
         (title or "Unknown").strip(),
         (full_text or "No Content Detected").strip(),
     )
