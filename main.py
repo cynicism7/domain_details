@@ -5,10 +5,11 @@
 """
 
 import argparse
+import gc
 from pathlib import Path
 
 from extractors import extract_title_abstract_body
-from llm_client import identify_domain
+from llm_client import identify_domain, clear_llm_context
 from storage import ensure_db, upsert_domain, export_csv, list_domains, query_by_domain
 
 
@@ -34,8 +35,11 @@ def _default_config() -> dict:
             "model": "qwen2.5:7b",
             "api_base": "http://localhost:1234/v1",
             "api_key": "not-needed",
+            "ollama_base": "http://localhost:11434",
         },
         "max_chars_for_llm": 3000,
+        "max_prompt_chars": 4096,
+        "clear_context_every_n": None,
         "output": {
             "db_path": "./literature_domains.db",
             "export_csv": True,
@@ -64,6 +68,8 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
     exts = cfg.get("extensions", [".pdf", ".docx", ".doc", ".txt"])
     llm_cfg = cfg.get("llm", {})
     max_chars = cfg.get("max_chars_for_llm", 800)
+    max_prompt_chars = cfg.get("max_prompt_chars", 4096)
+    clear_context_every_n = cfg.get("clear_context_every_n")
     out = cfg.get("output", {})
     db_path = out.get("db_path", "./literature_domains.db")
     do_csv = out.get("export_csv", True)
@@ -101,9 +107,22 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
             temperature=llm_cfg.get("temperature", 0.0),
             system_prompt=llm_cfg.get("system_prompt"),
             preferred_domains=cfg.get("preferred_domains"),
+            max_prompt_chars=max_prompt_chars,
         )
         upsert_domain(conn, fp, domain_cn, domain_en)
         print(f"{domain_cn} | {domain_en}")
+        # 每篇文献后不再保留大块文本引用；每 50 篇主动 gc
+        del content_for_llm
+        if i % 50 == 0:
+            gc.collect()
+        # 定期清理 LM 上下文（如 LM Studio 卸载模型再加载，清空显存/上下文），领域判断无需历史
+        if clear_context_every_n and i % clear_context_every_n == 0 and i > 0:
+            clear_llm_context(
+                provider=provider,
+                model=llm_cfg.get("model", "qwen2.5:7b"),
+                api_base=llm_cfg.get("api_base", "http://localhost:1234/v1"),
+                api_key=llm_cfg.get("api_key", "not-needed"),
+            )
     conn.close()
 
     if do_csv:

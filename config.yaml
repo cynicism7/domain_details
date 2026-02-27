@@ -22,6 +22,10 @@ llm:
 #   - ...
 # 送交的文献内容上限（仅标题/作者/研究团队/摘要），越小越快
 max_chars_for_llm: 800
+# 单次请求「系统提示+用户提示」总字符数上限，避免本地模型上下文过长导致内存越界（大批量文献时尤为重要）
+max_prompt_chars: 4096
+# 每处理 N 篇文献后调用 LM Studio 卸载模型再加载，清空显存/上下文，避免大批量时内存越界。不设或 0 表示不定期清理
+clear_context_every_n: 50
 output:
   db_path: "./literature_domains.db"
   export_csv: True

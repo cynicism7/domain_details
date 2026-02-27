@@ -43,6 +43,43 @@ def ask_ollama(prompt: str, model: str = "qwen2.5:7b", timeout: int = 120) -> st
         return f"[Ollama 请求失败: {e}]"
 
 
+def clear_llm_context(
+    provider: str,
+    model: str = "qwen2.5:7b",
+    api_base: str = "http://localhost:1234/v1",
+    api_key: str = "not-needed",
+) -> None:
+    """
+    定期清理本地模型上下文/显存，避免大批量跑时内存累积。领域判断无需对话历史，可安全调用。
+    - LM Studio（openai_api）：调用 LM Studio 原生接口 POST /api/v1/models/unload 卸载当前模型，释放显存；
+      下次请求时会由 LM Studio 自动重新加载，从而清空上下文。
+    - 其他 provider（如 ollama）：仅做进程内 gc。
+    """
+    if provider == "mock":
+        return
+    if provider == "openai_api":
+        try:
+            import requests
+            # 从 OpenAI 兼容 base（如 http://127.0.0.1:1234/v1）得到 host，拼 LM Studio 原生 unload 地址
+            base = api_base.rstrip("/").replace("/v1", "")
+            url = f"{base}/api/v1/models/unload"
+            headers = {"Content-Type": "application/json"}
+            if api_key and api_key != "not-needed":
+                headers["Authorization"] = f"Bearer {api_key}"
+            r = requests.post(
+                url,
+                json={"instance_id": model},
+                headers=headers,
+                timeout=30,
+            )
+            r.raise_for_status()
+        except Exception:
+            pass
+        return
+    import gc
+    gc.collect()
+
+
 def ask_openai_api(
     prompt: str,
     model: str = "local-model",
@@ -89,6 +126,9 @@ import json
 DEFAULT_SYSTEM_PROMPT = """你是文献领域分类器。本任务只需从给定内容判断一个学科名称，无需推理过程。
 禁止使用 <think> 或任何思考标签，不要输出解释，直接只输出一行 JSON：{"field": "学科名称"}。"""
 
+# 单次请求上下文总长度上限（系统提示 + 用户提示），防止本地模型上下文过长导致内存越界
+DEFAULT_MAX_PROMPT_CHARS = 4096
+
 # 基础领域列表：优先让 AI 从此列表中选择；若不贴近再自行生成
 PREFERRED_DOMAINS = [
     "细胞生物学", "分子生物学", "免疫学", "肿瘤学", "癌症生物学", "干细胞生物学", "发育生物学",
@@ -96,6 +136,21 @@ PREFERRED_DOMAINS = [
     "体外受精", "生殖生物学", "培养肉", "合成生物学", "微生物学", "植物生物学", "神经科学",
     "内分泌学", "代谢研究", "流行病学", "公共卫生",
 ]
+
+
+def _truncate_for_context(s: str, max_chars: int) -> str:
+    """将文本截断到 max_chars 以内，尽量在句末截断，避免单次请求上下文过长导致内存越界。"""
+    if not s or max_chars <= 0:
+        return ""
+    s = s.strip()
+    if len(s) <= max_chars:
+        return s
+    truncated = s[:max_chars]
+    for sep in ("\n", "。", ".", " ", "，", ","):
+        last = truncated.rfind(sep)
+        if last > max_chars // 2:
+            return truncated[: last + 1].strip()
+    return truncated.strip()
 
 
 def identify_domain(
@@ -110,16 +165,21 @@ def identify_domain(
     temperature: float = 0.0,
     system_prompt: Optional[str] = None,
     preferred_domains: Optional[list] = None,
+    max_prompt_chars: Optional[int] = None,
 ) -> tuple[str, str]:
     """
     调用本地大模型识别文献最接近的最小领域，返回 (domain_cn, domain_en)。
     未分类或解析失败时会自动重试一次。system_prompt 可抑制思考型模型的 <think> 以提速并避免截断。
     preferred_domains 为空时使用内置 PREFERRED_DOMAINS；AI 优先从该列表中选，不贴近再自拟。
+    max_prompt_chars：单次请求「系统提示+用户提示」总字符数上限，避免上下文过长导致本地模型内存越界；不设则使用 DEFAULT_MAX_PROMPT_CHARS。
     """
     domains_list = preferred_domains if preferred_domains is not None else PREFERRED_DOMAINS
     domains_str = "、".join(domains_list)
+    title_s = (title or "Unknown").strip()
+    content_s = (full_text or "No Content Detected").strip()
 
-    prompt = """判断下面文献的最接近最小领域（学科）。
+    # 固定前缀长度（不含文献正文），用于计算正文可用的最大长度
+    prompt_prefix_tpl = """判断下面文献的最接近最小领域（学科）。
 请优先从以下领域中选择最贴近的一项：%s
 若以上均不贴近，再自行给出一个学科名称。只输出一个中文名。
 直接输出一行 JSON，不要 <think>、不要解释：
@@ -128,17 +188,19 @@ def identify_domain(
 【文件名】%s
 
 【标题、作者、机构、摘要】
-%s""" % (
-        domains_str,
-        (title or "Unknown").strip(),
-        (full_text or "No Content Detected").strip(),
-    )
+"""
+    prompt_prefix = prompt_prefix_tpl % (domains_str, title_s)
+    sys_msg = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
+    cap = max_prompt_chars if max_prompt_chars is not None else DEFAULT_MAX_PROMPT_CHARS
+    # 总上下文 = 系统提示 + 前缀 + 正文，限制在 cap 内
+    max_content = max(0, cap - len(sys_msg) - len(prompt_prefix))
+    content_s = _truncate_for_context(content_s, max_content)
+
+    prompt = prompt_prefix + content_s
 
     if provider == "mock":
         cn, en = _identify_domain_mock(title or "", "", full_text or "")
         return cn, en
-
-    sys_msg = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
 
     def _call() -> str:
         if provider == "openai_api":
