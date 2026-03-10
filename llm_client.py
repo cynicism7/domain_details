@@ -4,6 +4,9 @@
 import re
 from typing import Optional, Tuple
 
+# 流式响应中用于尽早截断：一旦看到完整 JSON 就返回
+_FIELD_JSON_PATTERN = re.compile(r'\{\s*"field"\s*:\s*"[^"]*"\s*\}')
+
 
 def _normalize_domain(raw: str) -> str:
     """从模型输出中提取单一领域标签，去除多余符号和换行。"""
@@ -20,8 +23,33 @@ def _normalize_domain(raw: str) -> str:
     return s if s else "未分类"
 
 
-def ask_ollama(prompt: str, model: str = "qwen2.5:7b", timeout: int = 120) -> str:
-    """通过 Ollama 本地 API 请求，返回模型回复文本。"""
+def ask_ollama(prompt: str, model: str = "qwen2.5:7b", timeout: int = 60, stream: bool = False) -> str:
+    """通过 Ollama 本地 API 请求，返回模型回复文本。stream=True 时流式接收，收到完整 JSON 即返回。"""
+    if stream:
+        try:
+            import requests
+            r = requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": model, "prompt": prompt, "stream": True},
+                timeout=timeout,
+                stream=True,
+            )
+            r.raise_for_status()
+            buf = ""
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    import json as _json
+                    part = _json.loads(line)
+                    buf += (part.get("response") or "")
+                    if _FIELD_JSON_PATTERN.search(buf):
+                        return buf.strip()
+                except (ValueError, KeyError):
+                    continue
+            return buf.strip()
+        except Exception as e:
+            return f"[Ollama 请求失败: {e}]"
     try:
         import ollama
     except ImportError:
@@ -85,12 +113,13 @@ def ask_openai_api(
     model: str = "local-model",
     api_base: str = "http://localhost:1234/v1",
     api_key: str = "not-needed",
-    timeout: int = 120,
-    max_tokens: int = 512,
+    timeout: int = 60,
+    max_tokens: int = 128,
     temperature: float = 0.0,
     system_prompt: Optional[str] = None,
+    stream: bool = False,
 ) -> str:
-    """通过 OpenAI 兼容 API（如 LM Studio）请求。system_prompt 可约束思考型模型少用 <think>、直接输出。"""
+    """通过 OpenAI 兼容 API（如 LM Studio）请求。stream=True 时收到完整 JSON 即返回，可略缩短等待。"""
     try:
         from openai import OpenAI
     except ImportError:
@@ -101,6 +130,25 @@ def ask_openai_api(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
     try:
+        if stream:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+                stream=True,
+            )
+            buf = ""
+            for chunk in resp:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if getattr(delta, "content", None):
+                    buf += delta.content
+                    if _FIELD_JSON_PATTERN.search(buf):
+                        return buf.strip()
+            return buf.strip()
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -111,7 +159,6 @@ def ask_openai_api(
         msg = resp.choices[0].message.content if resp.choices else ""
         return (msg or "").strip()
     except Exception as e:
-        # 提取 HTTP 状态码与原因，便于排查 502/503 等
         err_msg = str(e).strip() or repr(e)
         status_code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
         if status_code is not None:
@@ -161,19 +208,24 @@ def identify_domain(
     model: str = "qwen2.5:7b",
     api_base: str = "http://localhost:1234/v1",
     api_key: str = "not-needed",
-    max_tokens: int = 512,
+    max_tokens: int = 128,
     temperature: float = 0.0,
+    timeout: int = 60,
     system_prompt: Optional[str] = None,
     preferred_domains: Optional[list] = None,
     max_prompt_chars: Optional[int] = None,
+    stream: bool = False,
+    max_preferred_domains_in_prompt: Optional[int] = None,
 ) -> tuple[str, str]:
     """
     调用本地大模型识别文献最接近的最小领域，返回 (domain_cn, domain_en)。
-    未分类或解析失败时会自动重试一次。system_prompt 可抑制思考型模型的 <think> 以提速并避免截断。
-    preferred_domains 为空时使用内置 PREFERRED_DOMAINS；AI 优先从该列表中选，不贴近再自拟。
-    max_prompt_chars：单次请求「系统提示+用户提示」总字符数上限，避免上下文过长导致本地模型内存越界；不设则使用 DEFAULT_MAX_PROMPT_CHARS。
+    未分类或解析失败时会自动重试一次。
+    stream=True 时流式接收，收到完整 JSON 即返回，可略缩短等待。
+    max_preferred_domains_in_prompt 限制提示中领域数量，减少 token 以提速。
     """
     domains_list = preferred_domains if preferred_domains is not None else PREFERRED_DOMAINS
+    if max_preferred_domains_in_prompt is not None and max_preferred_domains_in_prompt > 0:
+        domains_list = domains_list[: max_preferred_domains_in_prompt]
     domains_str = "、".join(domains_list)
     title_s = (title or "Unknown").strip()
     content_s = (full_text or "No Content Detected").strip()
@@ -207,9 +259,9 @@ def identify_domain(
             return ask_openai_api(
                 prompt, model=model, api_base=api_base, api_key=api_key,
                 max_tokens=max_tokens, temperature=temperature,
-                system_prompt=sys_msg,
+                timeout=timeout, system_prompt=sys_msg, stream=stream,
             )
-        return ask_ollama(prompt, model=model)
+        return ask_ollama(prompt, model=model, timeout=timeout, stream=stream)
 
     def _normalize_minimal_domain(domain_cn: str, domain_en: str) -> Tuple[str, str]:
         """清洗并校验最小领域标签，空或含 <think>/</think> 则返回未分类。"""
@@ -306,13 +358,14 @@ def identify_domain(
 
     raw = _call()
     result = _parse(raw)
-    if result is not None and result[0] not in ("", "未分类"):
+    # 解析成功（含「未分类」）直接返回，避免无谓重试
+    if result is not None:
         return result
+    # 仅解析失败时重试一次
     raw2 = _call()
     result = _parse(raw2)
     if result is not None:
         return result
-    # 解析失败时从回复中提取单一领域标签（禁止把 <think>/</think> 当领域）
     s = (raw2 or raw or "").strip()
     cn = _normalize_domain(s)
     if cn and cn != "未分类" and "<think>" not in cn and "</think>" not in cn:

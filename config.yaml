@@ -2,15 +2,33 @@ literature_dirs:
   - "./papers"
 extensions:
   - ".pdf"
+# 换成本地大模型：改下面 llm.model 即可（LM Studio / Ollama 里显示的模型名）。
+#
+# 文献领域分类：选「无思考、直接输出」的模型；模型越小/量化越低，通常越快。
+#
+# 比 7B 更合适、通常更快（推荐优先尝试）：
+#   - Qwen2.5-3B：中文好、分类够用，显存小、延迟低（LM: Qwen2.5-3B-Instruct | Ollama: qwen2.5:3b）
+#   - Phi-3-mini、Gemma-2-2B、Llama-3.2-3B：同样适合短分类，速度优于 7B
+#
+# 追求极速（略牺牲中文或准确率时可试）：
+#   - SmolLM-1.7B / 360M、TinyLlama 1.1B、Llama-3.2-1B（Ollama: smollm、tinyllama、llama3.2:1b）
+#
+# 量化：同模型选 Q4_K_M / Q4_0 比 Q8 更快（在 LM Studio / Ollama 选对应量化版本）。
+# 避免：带「思考/推理」的模型（DeepSeek-R1、QwQ 等），会多花 2~10 秒且易截断。
 llm:
   provider: "openai_api"
-  model: "Qwen2.5-VL-7B-Instruct"
+  model: "Qwen2.5-7B-Instruct"
   api_base: "http://127.0.0.1:1234/v1"
   api_key: "lm-studio"
-  # 思考型模型易把 token 耗在 <think> 里导致截断：可增大 max_tokens（如 1024）或换用非思考型小模型（如 Qwen2.5-7B）提速且更稳
-  max_tokens: 512
+  # 领域名很短：64 可再提速，128 更稳；思考型若被截断可改为 256~512
+  max_tokens: 64
   temperature: 0.0
-  # 可选：自定义 system_prompt，不填则用内置提示（约束模型不要 <think>、直接输出 JSON）
+  timeout: 60
+  # 流式接收，收到完整 JSON 即返回，可略缩短每篇耗时（约 0.2~0.5s）
+  stream: true
+  # 首次扫描前发一次最小请求预热模型，避免第一篇明显变慢（冷启动）
+  warmup: false
+  # 可选：自定义 system_prompt；不填则用内置（禁止 <think>、直接输出 JSON）
   # system_prompt: "你是分类器。禁止 <think>，只输出一行 {\"field\": \"学科名称\"}。"
 # 可选：优先让 AI 从以下领域中选择，不贴近再自拟。不填则使用程序内置列表
 # preferred_domains:
@@ -20,13 +38,19 @@ llm:
 #   - 肿瘤学
 #   - 公共卫生
 #   - ...
-# 送交的文献内容上限（仅标题/作者/研究团队/摘要），越小越快
-max_chars_for_llm: 800
-# 单次请求「系统提示+用户提示」总字符数上限，避免本地模型上下文过长导致内存越界（大批量文献时尤为重要）
+# 送交的文献内容上限；500~600 通常够分类且能再提速，800 更稳
+max_chars_for_llm: 600
+# 提示中最多列出的领域数量，减少可降低 token、略提速（不设则用全部）
+max_preferred_domains_in_prompt: 12
+# 单次请求「系统提示+用户提示」总字符数上限，避免本地模型上下文过长导致内存越界
 max_prompt_chars: 4096
-# 每处理 N 篇文献后调用 LM Studio 卸载模型再加载，清空显存/上下文，避免大批量时内存越界。不设或 0 表示不定期清理
+# 每处理 N 篇后卸载模型清显存（仅串行时生效）。显存够用可设大或注释掉以少卸载、提速
 clear_context_every_n: 50
+# 并发数：>1 时多线程同时处理多篇，显著提速；需服务端支持多请求（Ollama 可设 OLLAMA_NUM_PARALLEL）
+concurrency: 1
+# ---------- 本地部署可优化项 ----------
+# 已做：流式(stream)、少 token(max_tokens/ max_chars_for_llm/ max_preferred_domains_in_prompt)
+# 可选：warmup: true 首请求预热；concurrency: 2~4 提高吞吐；换 3B/量化模型进一步降延迟
 output:
-  db_path: "./literature_domains.db"
-  export_csv: True
   csv_path: "./literature_domains.csv"
+  log_path: "./scan.log"
