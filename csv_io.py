@@ -6,13 +6,28 @@ import queue
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Set
+from typing import List, Optional, Tuple, Set
 
 HEADERS = ["file_path", "file_name", "domain_cn", "domain_en", "updated_at"]
+# 断点续跑用：仅存路径，一行一个，读取比解析整份 CSV 快得多
+DONE_SUFFIX = ".done"
 
 
 def load_processed_paths(csv_path: str) -> Set[str]:
-    """从已有 CSV 中读取已处理的 file_path 集合，用于断点续跑。"""
+    """从 .done 或 CSV 读取已处理路径集合；优先 .done（大文献量时启动更快）。"""
+    done_path = Path(csv_path + DONE_SUFFIX)
+    if done_path.exists():
+        paths = set()
+        try:
+            with open(done_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if s:
+                        paths.add(s)
+            return paths
+        except Exception:
+            pass
+    # 无 .done 时从 CSV 读一次，并生成 .done 供下次使用
     p = Path(csv_path)
     if not p.exists():
         return set()
@@ -23,7 +38,12 @@ def load_processed_paths(csv_path: str) -> Set[str]:
             next(r, None)
             for row in r:
                 if len(row) >= 1 and row[0].strip():
-                    paths.add(str(Path(row[0]).resolve()))
+                    resolved = str(Path(row[0]).resolve())
+                    paths.add(resolved)
+        if paths:
+            with open(done_path, "w", encoding="utf-8") as out:
+                for x in paths:
+                    out.write(x + "\n")
     except Exception:
         pass
     return paths
@@ -40,28 +60,65 @@ def _ensure_header(csv_path: str) -> None:
         w.writerow(HEADERS)
 
 
-def append_row_sync(csv_path: str, file_path: str, file_name: str, domain_cn: str, domain_en: str) -> None:
-    """同步追加一行到 CSV（供单线程或后台线程调用）。"""
+def _alt_csv_path(csv_path: str) -> str:
+    """主文件被占用时的备用路径，如 literature_domains.csv -> literature_domains_alt.csv。"""
     p = Path(csv_path)
+    return str(p.parent / (p.stem + "_alt" + p.suffix))
+
+
+def append_row_sync(
+    csv_path: str,
+    file_path: str,
+    file_name: str,
+    domain_cn: str,
+    domain_en: str,
+    effective_path_ref: Optional[list] = None,
+) -> None:
+    """同步追加一行到 CSV 与 .done；若主文件被占用则自动改用 _alt 文件并继续。"""
+    import logging as _log
+    path_to_use = effective_path_ref[0] if effective_path_ref else csv_path
+    p = Path(path_to_use)
     p.parent.mkdir(parents=True, exist_ok=True)
     if not p.exists():
-        _ensure_header(csv_path)
+        _ensure_header(path_to_use)
     resolved_path = str(Path(file_path).resolve())
     row = [resolved_path, file_name or "", domain_cn or "", domain_en or "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
-    with open(p, "a", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(row)
+    try:
+        with open(p, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(row)
+        try:
+            with open(p.parent / (p.name + DONE_SUFFIX), "a", encoding="utf-8") as d:
+                d.write(resolved_path + "\n")
+        except Exception:
+            pass
+    except PermissionError:
+        alt = _alt_csv_path(csv_path)
+        if effective_path_ref is not None:
+            effective_path_ref[0] = alt
+            _log.getLogger(__name__).warning(
+                "主 CSV 被占用（如被 Excel 打开），已自动改用备用文件: %s", alt
+            )
+        _ensure_header(alt)
+        with open(Path(alt), "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(row)
+        try:
+            with open(Path(alt).parent / (Path(alt).name + DONE_SUFFIX), "a", encoding="utf-8") as d:
+                d.write(resolved_path + "\n")
+        except Exception:
+            pass
 
 
-def _writer_loop(csv_path: str, q: queue.Queue, stop: threading.Event) -> None:
-    """后台线程：从队列取结果并追加写入 CSV。"""
+def _writer_loop(csv_path: str, q: queue.Queue, stop: threading.Event, effective_path_ref: list) -> None:
+    """后台线程：从队列取结果并追加写入 CSV（被占用时自动写备用文件）。"""
     while True:
         try:
             item = q.get(timeout=0.5)
             if item is None:
                 break
             file_path, file_name, domain_cn, domain_en = item
-            append_row_sync(csv_path, file_path, file_name, domain_cn, domain_en)
+            append_row_sync(csv_path, file_path, file_name, domain_cn, domain_en, effective_path_ref)
         except queue.Empty:
             if stop.is_set():
                 break
@@ -72,16 +129,17 @@ def _writer_loop(csv_path: str, q: queue.Queue, stop: threading.Event) -> None:
 
 
 class CsvWriterAsync:
-    """异步写入 CSV：主线程入队，后台线程写入，不阻断识别。"""
+    """异步写入 CSV：主线程入队，后台线程写入，不阻断识别；主文件被占用时自动写备用 _alt 文件。"""
 
     def __init__(self, csv_path: str):
         self.csv_path = csv_path
         self._q = queue.Queue()
         self._stop = threading.Event()
+        self._effective_path_ref = [csv_path]
         _ensure_header(csv_path)
         self._thread = threading.Thread(
             target=_writer_loop,
-            args=(csv_path, self._q, self._stop),
+            args=(csv_path, self._q, self._stop, self._effective_path_ref),
             daemon=True,
         )
         self._thread.start()

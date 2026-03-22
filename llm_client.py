@@ -1,74 +1,77 @@
 # -*- coding: utf-8 -*-
-"""本地大模型调用：支持 Ollama 与 OpenAI 兼容 API（如 LM Studio）。"""
+"""Local LLM helpers for domain classification."""
 
+import json
 import re
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-# 流式响应中用于尽早截断：一旦看到完整 JSON 就返回
+# Streamed responses can stop early once a valid field JSON appears.
 _FIELD_JSON_PATTERN = re.compile(r'\{\s*"field"\s*:\s*"[^"]*"\s*\}')
 
 
 def _normalize_domain(raw: str) -> str:
-    """从模型输出中提取单一领域标签，去除多余符号和换行。"""
+    """Normalize raw model output into a single short label."""
     if not raw or not isinstance(raw, str):
         return "未分类"
-    s = raw.strip()
-    # 取第一行或第一个逗号/句号前
+
+    text = raw.strip()
     for sep in ("\n", "，", "。", ",", "."):
-        if sep in s:
-            s = s.split(sep)[0].strip()
-    # 去掉常见前缀和引号
-    s = re.sub(r"^(领域|学科|类别|领域：|学科：|类别：)\s*", "", s, flags=re.I)
-    s = s.strip('"\' \t')
-    return s if s else "未分类"
+        if sep in text:
+            text = text.split(sep)[0].strip()
+    text = re.sub(r"^(领域|学科|类别|一级领域|二级领域|领域：|学科：|类别：)\s*", "", text, flags=re.I)
+    text = text.strip('"\' \t')
+    return text if text else "未分类"
 
 
 def ask_ollama(prompt: str, model: str = "qwen2.5:7b", timeout: int = 60, stream: bool = False) -> str:
-    """通过 Ollama 本地 API 请求，返回模型回复文本。stream=True 时流式接收，收到完整 JSON 即返回。"""
+    """Request a completion from a local Ollama server."""
     if stream:
         try:
             import requests
-            r = requests.post(
+
+            response = requests.post(
                 "http://localhost:11434/api/generate",
                 json={"model": model, "prompt": prompt, "stream": True},
                 timeout=timeout,
                 stream=True,
             )
-            r.raise_for_status()
+            response.raise_for_status()
             buf = ""
-            for line in r.iter_lines(decode_unicode=True):
+            for line in response.iter_lines(decode_unicode=True):
                 if not line:
                     continue
                 try:
-                    import json as _json
-                    part = _json.loads(line)
-                    buf += (part.get("response") or "")
-                    if _FIELD_JSON_PATTERN.search(buf):
-                        return buf.strip()
-                except (ValueError, KeyError):
+                    part = json.loads(line)
+                except ValueError:
                     continue
+                buf += part.get("response") or ""
+                if _FIELD_JSON_PATTERN.search(buf):
+                    return buf.strip()
             return buf.strip()
-        except Exception as e:
-            return f"[Ollama 请求失败: {e}]"
+        except Exception as exc:
+            return f"[Ollama 请求失败: {exc}]"
+
     try:
         import ollama
     except ImportError:
         try:
             import requests
-            r = requests.post(
+
+            response = requests.post(
                 "http://localhost:11434/api/generate",
                 json={"model": model, "prompt": prompt, "stream": False},
                 timeout=timeout,
             )
-            r.raise_for_status()
-            return (r.json().get("response") or "").strip()
-        except Exception as e:
-            return f"[Ollama 请求失败: {e}]"
+            response.raise_for_status()
+            return (response.json().get("response") or "").strip()
+        except Exception as exc:
+            return f"[Ollama 请求失败: {exc}]"
+
     try:
-        resp = ollama.generate(model=model, prompt=prompt)
-        return (resp.get("response") or "").strip()
-    except Exception as e:
-        return f"[Ollama 请求失败: {e}]"
+        payload = ollama.generate(model=model, prompt=prompt)
+        return (payload.get("response") or "").strip()
+    except Exception as exc:
+        return f"[Ollama 请求失败: {exc}]"
 
 
 def clear_llm_context(
@@ -77,34 +80,32 @@ def clear_llm_context(
     api_base: str = "http://localhost:1234/v1",
     api_key: str = "not-needed",
 ) -> None:
-    """
-    定期清理本地模型上下文/显存，避免大批量跑时内存累积。领域判断无需对话历史，可安全调用。
-    - LM Studio（openai_api）：调用 LM Studio 原生接口 POST /api/v1/models/unload 卸载当前模型，释放显存；
-      下次请求时会由 LM Studio 自动重新加载，从而清空上下文。
-    - 其他 provider（如 ollama）：仅做进程内 gc。
-    """
+    """Release local model state where possible."""
     if provider == "mock":
         return
+
     if provider == "openai_api":
         try:
             import requests
-            # 从 OpenAI 兼容 base（如 http://127.0.0.1:1234/v1）得到 host，拼 LM Studio 原生 unload 地址
+
             base = api_base.rstrip("/").replace("/v1", "")
             url = f"{base}/api/v1/models/unload"
             headers = {"Content-Type": "application/json"}
             if api_key and api_key != "not-needed":
                 headers["Authorization"] = f"Bearer {api_key}"
-            r = requests.post(
+            response = requests.post(
                 url,
                 json={"instance_id": model},
                 headers=headers,
                 timeout=30,
             )
-            r.raise_for_status()
+            response.raise_for_status()
         except Exception:
             pass
         return
+
     import gc
+
     gc.collect()
 
 
@@ -119,19 +120,21 @@ def ask_openai_api(
     system_prompt: Optional[str] = None,
     stream: bool = False,
 ) -> str:
-    """通过 OpenAI 兼容 API（如 LM Studio）请求。stream=True 时收到完整 JSON 即返回，可略缩短等待。"""
+    """Request a chat completion from an OpenAI-compatible local API."""
     try:
         from openai import OpenAI
     except ImportError:
         return "[未安装 openai 包]"
+
     client = OpenAI(base_url=api_base, api_key=api_key)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
+
     try:
         if stream:
-            resp = client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -140,7 +143,7 @@ def ask_openai_api(
                 stream=True,
             )
             buf = ""
-            for chunk in resp:
+            for chunk in response:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -149,55 +152,452 @@ def ask_openai_api(
                     if _FIELD_JSON_PATTERN.search(buf):
                         return buf.strip()
             return buf.strip()
-        resp = client.chat.completions.create(
+
+        response = client.chat.completions.create(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             timeout=timeout,
         )
-        msg = resp.choices[0].message.content if resp.choices else ""
-        return (msg or "").strip()
-    except Exception as e:
-        err_msg = str(e).strip() or repr(e)
-        status_code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+        message = response.choices[0].message.content if response.choices else ""
+        return (message or "").strip()
+    except Exception as exc:
+        err_msg = str(exc).strip() or repr(exc)
+        status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
         if status_code is not None:
             err_msg = f"HTTP {status_code} - {err_msg}"
+        if status_code == 502:
+            err_msg += " （502 常见原因：config 里 llm.model 与 LM Studio 当前加载的模型名不一致，或模型未加载。请在 LM Studio 中确认已加载模型，且「开发」/ Local Server 里显示的 model 与 config 中 model 完全一致）"
         return f"[API 请求失败: {err_msg}]"
 
 
-import json
+DEFAULT_SYSTEM_PROMPT = """你是文献领域分类器。
+你只需要做标签选择，不需要输出推理过程。
+禁止使用 <think> 或任何思考标签，不要输出解释。
+始终只输出一行 JSON：{"field": "标签名"}。"""
 
-
-# 默认系统提示：约束思考型模型少用 <think>、直接输出 JSON，提升速度并避免被截断
-DEFAULT_SYSTEM_PROMPT = """你是文献领域分类器。本任务只需从给定内容判断一个学科名称，无需推理过程。
-禁止使用 <think> 或任何思考标签，不要输出解释，直接只输出一行 JSON：{"field": "学科名称"}。"""
-
-# 单次请求上下文总长度上限（系统提示 + 用户提示），防止本地模型上下文过长导致内存越界
 DEFAULT_MAX_PROMPT_CHARS = 4096
 
-# 基础领域列表：优先让 AI 从此列表中选择；若不贴近再自行生成
-PREFERRED_DOMAINS = [
-    "细胞生物学", "分子生物学", "免疫学", "肿瘤学", "癌症生物学", "干细胞生物学", "发育生物学",
-    "药理学", "毒理学", "再生医学", "组织工程", "疫苗学", "病毒学", "生物制药", "生物技术",
-    "体外受精", "生殖生物学", "培养肉", "合成生物学", "微生物学", "植物生物学", "神经科学",
-    "内分泌学", "代谢研究", "流行病学", "公共卫生",
-]
 
-
-def _truncate_for_context(s: str, max_chars: int) -> str:
-    """将文本截断到 max_chars 以内，尽量在句末截断，避免单次请求上下文过长导致内存越界。"""
-    if not s or max_chars <= 0:
+def _truncate_for_context(text: str, max_chars: int) -> str:
+    if not text or max_chars <= 0:
         return ""
-    s = s.strip()
-    if len(s) <= max_chars:
-        return s
-    truncated = s[:max_chars]
-    for sep in ("\n", "。", ".", " ", "，", ","):
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars]
+    for sep in ("\n", "。", ".", " ", "，", ",", ";"):
         last = truncated.rfind(sep)
         if last > max_chars // 2:
             return truncated[: last + 1].strip()
     return truncated.strip()
+
+
+def _normalize_key(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"[\s\-_/:：,，。;；|（）()【】\[\]<>]+", "", text.lower())
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _dedupe(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _taxonomy_level1_map(taxonomy: Optional[dict]) -> Dict[str, dict]:
+    if not isinstance(taxonomy, dict):
+        return {}
+    level1 = taxonomy.get("level1")
+    return level1 if isinstance(level1, dict) else {}
+
+
+def _taxonomy_default_label(taxonomy: Optional[dict]) -> str:
+    if isinstance(taxonomy, dict):
+        label = taxonomy.get("default_label")
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    return "未分类"
+
+
+def _taxonomy_default_secondary_label(taxonomy: Optional[dict]) -> str:
+    if isinstance(taxonomy, dict):
+        label = taxonomy.get("default_secondary_label")
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    return "其他"
+
+
+def _taxonomy_global_aliases(taxonomy: Optional[dict]) -> Dict[str, str]:
+    aliases = taxonomy.get("global_aliases") if isinstance(taxonomy, dict) else None
+    if not isinstance(aliases, dict):
+        return {}
+    return {str(key): str(value) for key, value in aliases.items() if str(key).strip() and str(value).strip()}
+
+
+def _taxonomy_secondary_aliases(taxonomy: Optional[dict], primary: str) -> Dict[str, str]:
+    if not isinstance(taxonomy, dict):
+        return {}
+    secondary_aliases = taxonomy.get("secondary_aliases")
+    if not isinstance(secondary_aliases, dict):
+        return {}
+    aliases = secondary_aliases.get(primary)
+    if not isinstance(aliases, dict):
+        return {}
+    return {str(key): str(value) for key, value in aliases.items() if str(key).strip() and str(value).strip()}
+
+
+def _taxonomy_primary_aliases(taxonomy: Optional[dict]) -> Dict[str, str]:
+    alias_map: Dict[str, str] = {}
+    level1 = _taxonomy_level1_map(taxonomy)
+    for primary, node in level1.items():
+        alias_map[primary] = primary
+        children = node.get("children") if isinstance(node, dict) else []
+        for child in children or []:
+            alias_map[str(child)] = primary
+        for alias, target in _taxonomy_secondary_aliases(taxonomy, primary).items():
+            alias_map[alias] = primary
+            alias_map[target] = primary
+    for alias, target in _taxonomy_global_aliases(taxonomy).items():
+        primary = _find_primary_for_taxonomy_target(target, taxonomy)
+        if primary:
+            alias_map[alias] = primary
+            alias_map[target] = primary
+    return alias_map
+
+
+def _taxonomy_level1_candidates(taxonomy: Optional[dict]) -> List[str]:
+    candidates = list(_taxonomy_level1_map(taxonomy).keys())
+    default_label = _taxonomy_default_label(taxonomy)
+    if default_label not in candidates:
+        candidates.append(default_label)
+    return candidates
+
+
+def _taxonomy_level2_candidates(taxonomy: Optional[dict], primary: str) -> List[str]:
+    level1 = _taxonomy_level1_map(taxonomy)
+    node = level1.get(primary, {})
+    children = node.get("children") if isinstance(node, dict) else []
+    if not isinstance(children, list):
+        children = []
+    candidates = [str(item).strip() for item in children if str(item).strip()]
+    fallback = _taxonomy_default_secondary_label(taxonomy)
+    if fallback not in candidates:
+        candidates.append(fallback)
+    return _dedupe(candidates)
+
+
+def _find_primary_for_taxonomy_target(target: str, taxonomy: Optional[dict]) -> Optional[str]:
+    if not target:
+        return None
+    target_norm = _normalize_key(target)
+    level1 = _taxonomy_level1_map(taxonomy)
+    for primary, node in level1.items():
+        if _normalize_key(primary) == target_norm:
+            return primary
+        children = node.get("children") if isinstance(node, dict) else []
+        for child in children or []:
+            if _normalize_key(str(child)) == target_norm:
+                return primary
+    return None
+
+
+def _resolve_candidate(raw: str, candidates: List[str], alias_map: Optional[Dict[str, str]] = None) -> Optional[str]:
+    if not raw:
+        return None
+
+    candidate_map = {_normalize_key(candidate): candidate for candidate in candidates}
+    alias_lookup = {
+        _normalize_key(alias): target
+        for alias, target in (alias_map or {}).items()
+        if _normalize_key(alias) and _normalize_key(target) in candidate_map
+    }
+
+    variants = [_normalize_domain(raw)] + [part.strip() for part in re.split(r"[|/＞>]+", raw) if part.strip()]
+    for variant in variants:
+        norm = _normalize_key(variant)
+        if not norm:
+            continue
+        if norm in candidate_map:
+            return candidate_map[norm]
+        if norm in alias_lookup:
+            return candidate_map[_normalize_key(alias_lookup[norm])]
+        matches = [candidate for key, candidate in candidate_map.items() if key and (key in norm or norm in key)]
+        matches = _dedupe(matches)
+        if len(matches) == 1:
+            return matches[0]
+
+    return None
+
+
+def _parse_field_value(raw: str) -> Optional[str]:
+    if not raw or not isinstance(raw, str):
+        return None
+
+    work = raw.split("</think>")[-1].strip() if "</think>" in raw else raw.strip()
+    match = re.search(r'\{\s*"field"\s*:\s*"([^"]+)"\s*\}', work)
+    if match:
+        return _normalize_domain(match.group(1))
+
+    try:
+        for match in re.finditer(r'\{[^{}]*"field"[^{}]*\}', work):
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                continue
+            field = data.get("field")
+            if isinstance(field, str) and field.strip():
+                return _normalize_domain(field)
+    except Exception:
+        pass
+
+    field_line = _normalize_domain(work)
+    if field_line and field_line != "未分类":
+        return field_line
+    return None
+
+
+def _call_model(
+    prompt: str,
+    *,
+    provider: str,
+    model: str,
+    api_base: str,
+    api_key: str,
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
+    system_prompt: Optional[str],
+    stream: bool,
+) -> str:
+    if provider == "openai_api":
+        return ask_openai_api(
+            prompt,
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=timeout,
+            system_prompt=system_prompt,
+            stream=stream,
+        )
+    return ask_ollama(prompt, model=model, timeout=timeout, stream=stream)
+
+
+def _build_prompt(prefix: str, content: str, system_prompt: str, max_prompt_chars: int) -> str:
+    max_content = max(0, max_prompt_chars - len(system_prompt) - len(prefix))
+    return prefix + _truncate_for_context(content, max_content)
+def _build_level1_prompt(
+    title: str,
+    content: str,
+    candidates: List[str],
+    system_prompt: str,
+    max_prompt_chars: int,
+    default_label: str,
+) -> str:
+    prefix = """判断下面文献的一级领域。
+只能从以下候选中选择一项，不允许自造标签：
+%s
+如果无法判断，输出“%s”。
+直接输出一行 JSON，不要 <think>、不要解释：
+{"field": "一级领域"}
+
+【文件名】%s
+
+【文献信息】
+""" % ("、".join(candidates), default_label, title)
+    return _build_prompt(prefix, content, system_prompt, max_prompt_chars)
+
+
+def _build_level2_prompt(
+    title: str,
+    content: str,
+    primary: str,
+    candidates: List[str],
+    system_prompt: str,
+    max_prompt_chars: int,
+    default_secondary: str,
+) -> str:
+    prefix = """已知该文献的一级领域是“%s”。
+现在只在以下二级领域中选择一项，不允许自造标签：
+%s
+如果无法判断，输出“%s”。
+直接输出一行 JSON，不要 <think>、不要解释：
+{"field": "二级领域"}
+
+【文件名】%s
+
+【文献信息】
+""" % (primary, "、".join(candidates), default_secondary, title)
+    return _build_prompt(prefix, content, system_prompt, max_prompt_chars)
+
+
+def _score_candidates_from_text(text: str, candidates: List[str], alias_map: Optional[Dict[str, str]] = None) -> Optional[str]:
+    raw_lower = (text or "").lower()
+    norm_text = _normalize_key(text)
+    if not norm_text:
+        return None
+
+    scores = {candidate: 0 for candidate in candidates}
+    for candidate in candidates:
+        candidate_norm = _normalize_key(candidate)
+        if candidate_norm and candidate_norm in norm_text:
+            scores[candidate] += 6
+
+    for alias, target in (alias_map or {}).items():
+        alias_norm = _normalize_key(alias)
+        if not alias_norm or target not in scores:
+            continue
+        if _contains_cjk(alias):
+            if alias_norm in norm_text:
+                scores[target] += 5
+            continue
+        alias_word = re.sub(r"[^a-z0-9]+", "", alias.lower())
+        if len(alias_word) < 4:
+            if re.search(rf"(?<![a-z0-9]){re.escape(alias.lower())}(?![a-z0-9])", raw_lower):
+                scores[target] += 5
+            continue
+        if alias.lower() in raw_lower or alias_norm in norm_text:
+            scores[target] += 5
+
+    best_score = max(scores.values()) if scores else 0
+    if best_score <= 0:
+        return None
+    best = [candidate for candidate, score in scores.items() if score == best_score]
+    return best[0] if len(best) == 1 else None
+
+
+def _guess_primary_from_taxonomy(text: str, taxonomy: Optional[dict]) -> Optional[str]:
+    candidates = _taxonomy_level1_candidates(taxonomy)
+    default_label = _taxonomy_default_label(taxonomy)
+    candidates = [candidate for candidate in candidates if candidate != default_label]
+    return _score_candidates_from_text(text, candidates, _taxonomy_primary_aliases(taxonomy))
+
+
+def _guess_secondary_from_taxonomy(text: str, taxonomy: Optional[dict], primary: str) -> Optional[str]:
+    candidates = _taxonomy_level2_candidates(taxonomy, primary)
+    fallback = _taxonomy_default_secondary_label(taxonomy)
+    candidates = [candidate for candidate in candidates if candidate != fallback]
+    alias_map = _taxonomy_secondary_aliases(taxonomy, primary)
+    for alias, target in _taxonomy_global_aliases(taxonomy).items():
+        if _find_primary_for_taxonomy_target(target, taxonomy) == primary:
+            alias_map[alias] = target
+    return _score_candidates_from_text(text, candidates, alias_map)
+
+
+def _compose_domain_label(primary: str, secondary: str, taxonomy: Optional[dict]) -> str:
+    fallback = _taxonomy_default_secondary_label(taxonomy)
+    if not primary or primary == _taxonomy_default_label(taxonomy):
+        return _taxonomy_default_label(taxonomy)
+    if not secondary:
+        return primary
+    if secondary == fallback:
+        return f"{primary}/{fallback}"
+    return f"{primary}/{secondary}"
+
+
+def _uncategorized_result(taxonomy: Optional[dict]) -> Tuple[str, str]:
+    return _taxonomy_default_label(taxonomy), "Uncategorized"
+
+
+def _taxonomy_identify(
+    title: str,
+    content: str,
+    *,
+    provider: str,
+    model: str,
+    api_base: str,
+    api_key: str,
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
+    system_prompt: str,
+    max_prompt_chars: int,
+    stream: bool,
+    taxonomy: dict,
+) -> Tuple[str, str]:
+    default_label = _taxonomy_default_label(taxonomy)
+    default_secondary = _taxonomy_default_secondary_label(taxonomy)
+    level1_candidates = _taxonomy_level1_candidates(taxonomy)
+
+    prompt_level1 = _build_level1_prompt(
+        title,
+        content,
+        level1_candidates,
+        system_prompt,
+        max_prompt_chars,
+        default_label,
+    )
+
+    def _call(prompt: str) -> str:
+        return _call_model(
+            prompt,
+            provider=provider,
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=timeout,
+            system_prompt=system_prompt,
+            stream=stream,
+        )
+
+    primary = None
+    raw_primary = _call(prompt_level1)
+    field_primary = _parse_field_value(raw_primary)
+    if field_primary:
+        primary = _resolve_candidate(field_primary, level1_candidates, _taxonomy_primary_aliases(taxonomy))
+    if not primary:
+        raw_primary_2 = _call(prompt_level1)
+        field_primary = _parse_field_value(raw_primary_2)
+        if field_primary:
+            primary = _resolve_candidate(field_primary, level1_candidates, _taxonomy_primary_aliases(taxonomy))
+
+    if not primary:
+        primary = _guess_primary_from_taxonomy(title + "\n" + content, taxonomy) or default_label
+
+    if primary == default_label:
+        return default_label, "Uncategorized"
+
+    level2_candidates = _taxonomy_level2_candidates(taxonomy, primary)
+    prompt_level2 = _build_level2_prompt(
+        title,
+        content,
+        primary,
+        level2_candidates,
+        system_prompt,
+        max_prompt_chars,
+        default_secondary,
+    )
+
+    secondary = None
+    raw_secondary = _call(prompt_level2)
+    field_secondary = _parse_field_value(raw_secondary)
+    if field_secondary:
+        secondary = _resolve_candidate(field_secondary, level2_candidates, _taxonomy_secondary_aliases(taxonomy, primary))
+    if not secondary:
+        raw_secondary_2 = _call(prompt_level2)
+        field_secondary = _parse_field_value(raw_secondary_2)
+        if field_secondary:
+            secondary = _resolve_candidate(field_secondary, level2_candidates, _taxonomy_secondary_aliases(taxonomy, primary))
+
+    if not secondary:
+        secondary = _guess_secondary_from_taxonomy(title + "\n" + content, taxonomy, primary) or default_secondary
+
+    label = _compose_domain_label(primary, secondary, taxonomy)
+    return label, label
 
 
 def identify_domain(
@@ -212,185 +612,80 @@ def identify_domain(
     temperature: float = 0.0,
     timeout: int = 60,
     system_prompt: Optional[str] = None,
-    preferred_domains: Optional[list] = None,
     max_prompt_chars: Optional[int] = None,
     stream: bool = False,
-    max_preferred_domains_in_prompt: Optional[int] = None,
-) -> tuple[str, str]:
+    taxonomy: Optional[dict] = None,
+) -> Tuple[str, str]:
     """
-    调用本地大模型识别文献最接近的最小领域，返回 (domain_cn, domain_en)。
-    未分类或解析失败时会自动重试一次。
-    stream=True 时流式接收，收到完整 JSON 即返回，可略缩短等待。
-    max_preferred_domains_in_prompt 限制提示中领域数量，减少 token 以提速。
+    Identify the best-fitting domain label for a paper.
+    When taxonomy is provided, classification becomes a controlled two-stage process.
     """
-    domains_list = preferred_domains if preferred_domains is not None else PREFERRED_DOMAINS
-    if max_preferred_domains_in_prompt is not None and max_preferred_domains_in_prompt > 0:
-        domains_list = domains_list[: max_preferred_domains_in_prompt]
-    domains_str = "、".join(domains_list)
     title_s = (title or "Unknown").strip()
     content_s = (full_text or "No Content Detected").strip()
-
-    # 固定前缀长度（不含文献正文），用于计算正文可用的最大长度
-    prompt_prefix_tpl = """判断下面文献的最接近最小领域（学科）。
-请优先从以下领域中选择最贴近的一项：%s
-若以上均不贴近，再自行给出一个学科名称。只输出一个中文名。
-直接输出一行 JSON，不要 <think>、不要解释：
-{"field": "学科名称"}
-
-【文件名】%s
-
-【标题、作者、机构、摘要】
-"""
-    prompt_prefix = prompt_prefix_tpl % (domains_str, title_s)
     sys_msg = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
     cap = max_prompt_chars if max_prompt_chars is not None else DEFAULT_MAX_PROMPT_CHARS
-    # 总上下文 = 系统提示 + 前缀 + 正文，限制在 cap 内
-    max_content = max(0, cap - len(sys_msg) - len(prompt_prefix))
-    content_s = _truncate_for_context(content_s, max_content)
+    content_s = _truncate_for_context(content_s, max(0, cap - len(sys_msg) - 512))
 
-    prompt = prompt_prefix + content_s
+    if not _taxonomy_level1_map(taxonomy):
+        return _uncategorized_result(taxonomy)
 
     if provider == "mock":
-        cn, en = _identify_domain_mock(title or "", "", full_text or "")
-        return cn, en
+        return _identify_domain_mock(title_s, "", content_s, taxonomy=taxonomy)
 
-    def _call() -> str:
-        if provider == "openai_api":
-            return ask_openai_api(
-                prompt, model=model, api_base=api_base, api_key=api_key,
-                max_tokens=max_tokens, temperature=temperature,
-                timeout=timeout, system_prompt=sys_msg, stream=stream,
-            )
-        return ask_ollama(prompt, model=model, timeout=timeout, stream=stream)
-
-    def _normalize_minimal_domain(domain_cn: str, domain_en: str) -> Tuple[str, str]:
-        """清洗并校验最小领域标签，空或含 <think>/</think> 则返回未分类。"""
-        cn = (domain_cn or "").strip()
-        en = (domain_en or "").strip()
-        cn = _normalize_domain(cn) if cn else ""
-        if not en and cn:
-            en = cn
-        if not cn or cn == "未分类":
-            return "未分类", en if en else "Uncategorized"
-        if "<think>" in cn or "</think>" in cn:
-            return "未分类", "Uncategorized"
-        return cn, en if en else cn
-
-    # 约定格式：{"field": "学科名称"}
-    _FIELD_JSON_RE = re.compile(r'\{\s*"field"\s*:\s*"([^"]+)"\s*\}')
-
-    def _is_think_only(raw: str) -> bool:
-        """判断是否为「仅思考」输出：以 <think> 开头且未在 </think> 后给出 {"field": "..."}。"""
-        if not raw or not isinstance(raw, str):
-            return False
-        s = raw.strip()
-        if not s.lower().startswith("<think>"):
-            return False
-        if "</think>" not in s:
-            return True
-        after = s.split("</think>", 1)[-1].strip()
-        if not after:
-            return True
-        if _FIELD_JSON_RE.search(after):
-            return False
-        if '"field"' in after and '"' in after:
-            return False
-        return True
-
-    def _parse_field_format(text: str) -> Optional[Tuple[str, str]]:
-        """从 {"field": "学科名称"} 格式中解析领域。"""
-        m = _FIELD_JSON_RE.search(text)
-        if m:
-            cn = (m.group(1) or "").strip().strip("。，,、")
-            if cn and "<think>" not in cn and "</think>" not in cn and len(cn) <= 50:
-                return _normalize_minimal_domain(cn, cn)
-        try:
-            for m in re.finditer(r'\{[^{}]*"field"[^{}]*\}', text):
-                try:
-                    data = json.loads(m.group(0))
-                    if "field" in data and isinstance(data["field"], str):
-                        cn = (data["field"] or "").strip()
-                        if cn and "<think>" not in cn and "</think>" not in cn:
-                            return _normalize_minimal_domain(cn, cn)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass
-        return None
-
-    def _parse(raw: str) -> Optional[Tuple[str, str]]:
-        if not raw:
-            return None
-        if _is_think_only(raw):
-            return None
-        work = raw.split("</think>")[-1].strip() if "</think>" in raw else raw.strip()
-        # 1）优先检测 {"field": "学科名称"}
-        result = _parse_field_format(work)
-        if result is not None:
-            return result
-        try:
-            for m in re.finditer(r'\{[^{}]*"domain_cn"[^{}]*"domain_en"[^{}]*\}', work):
-                try:
-                    data = json.loads(m.group(0))
-                    if "domain_cn" in data and "domain_en" in data:
-                        return _normalize_minimal_domain(
-                            data.get("domain_cn", ""), data.get("domain_en", "")
-                        )
-                except (json.JSONDecodeError, ValueError):
-                    continue
-            match = re.search(r"\{.*\}", work, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-                if "field" in data:
-                    cn = (data.get("field") or "").strip()
-                    if cn:
-                        return _normalize_minimal_domain(cn, cn)
-                return _normalize_minimal_domain(
-                    data.get("domain_cn", ""), data.get("domain_en", "")
-                )
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass
-        if "|" in work:
-            parts = work.split("|")
-            if len(parts) >= 2:
-                return _normalize_minimal_domain(parts[0].strip(), parts[1].strip())
-        return None
-
-    raw = _call()
-    result = _parse(raw)
-    # 解析成功（含「未分类」）直接返回，避免无谓重试
-    if result is not None:
-        return result
-    # 仅解析失败时重试一次
-    raw2 = _call()
-    result = _parse(raw2)
-    if result is not None:
-        return result
-    s = (raw2 or raw or "").strip()
-    cn = _normalize_domain(s)
-    if cn and cn != "未分类" and "<think>" not in cn and "</think>" not in cn:
-        return cn, cn
-    return "未分类", "Uncategorized"
+    return _taxonomy_identify(
+        title_s,
+        content_s,
+        provider=provider,
+        model=model,
+        api_base=api_base,
+        api_key=api_key,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=timeout,
+        system_prompt=sys_msg,
+        max_prompt_chars=cap,
+        stream=stream,
+        taxonomy=taxonomy,
+    )
 
 
-def _identify_domain_mock(title: str, abstract: str, body: str) -> Tuple[str, str]:
+def _identify_domain_mock(
+    title: str,
+    abstract: str,
+    body: str,
+    *,
+    taxonomy: Optional[dict] = None,
+) -> Tuple[str, str]:
     """
-    模拟最小领域：根据标题/摘要/正文关键词返回最接近的最小领域（中英文），用于本地验证流程。
+    Deterministic mock classifier for local workflow verification.
     """
-    text = (title + " " + abstract + " " + body).lower()
-    # 按优先级匹配，返回第一个匹配到的最小领域
-    keyword_domains = [
-        (["computer", "computing", "algorithm", "机器学习", "深度学习", "神经网络", "软件", "计算机"], "计算机科学", "Computer Science"),
-        (["bioinformatics", "生物信息", "基因组", "genome", "蛋白组"], "生物信息学", "Bioinformatics"),
-        (["medical", "medicine", "hospital", "临床", "肿瘤", "癌症", "医学"], "医学", "Medicine"),
-        (["biology", "生物", "细胞", "cell", "基因", "生命科学"], "生命科学", "Life Science"),
-        (["chemistry", "化学", "分子"], "化学", "Chemistry"),
-        (["physics", "物理", "量子"], "物理学", "Physics"),
-        (["material", "材料", "纳米"], "材料科学", "Materials Science"),
-        (["agriculture", "农学", "作物"], "农学", "Agriculture"),
-        (["econom", "经济", "金融"], "经济学", "Economics"),
-    ]
-    for keywords, cn, en in keyword_domains:
-        if any(kw in text for kw in keywords):
-            return cn, en
-    return "未分类", "Uncategorized"
+    text = f"{title} {abstract} {body}".lower()
+
+    if not _taxonomy_level1_map(taxonomy):
+        return _uncategorized_result(taxonomy)
+
+    primary = _guess_primary_from_taxonomy(text, taxonomy)
+    if not primary:
+        keyword_domains = [
+            (["computer", "computing", "algorithm", "machine learning", "deep learning", "neural network", "software"], "计算机科学"),
+            (["bioinformatics", "genome", "proteome"], "生物信息学"),
+            (["medical", "medicine", "hospital", "clinical", "tumor", "cancer"], "医学"),
+            (["biology", "cell", "gene", "genetic", "life science"], "生物学"),
+            (["chemistry", "molecule", "molecular"], "化学"),
+            (["physics", "quantum"], "物理学"),
+            (["material", "nanomaterial", "polymer"], "材料科学"),
+            (["agriculture", "crop"], "农学"),
+            (["econom", "finance"], "经济学"),
+            (["geology", "geological", "slope", "landslide", "rock"], "地质学"),
+            (["civil", "bridge", "tunnel", "geotechnical"], "土木工程"),
+        ]
+        valid_primary = set(_taxonomy_level1_map(taxonomy).keys())
+        for keywords, candidate in keyword_domains:
+            if candidate in valid_primary and any(keyword in text for keyword in keywords):
+                primary = candidate
+                break
+    if not primary:
+        return _uncategorized_result(taxonomy)
+    secondary = _guess_secondary_from_taxonomy(text, taxonomy, primary) or _taxonomy_default_secondary_label(taxonomy)
+    label = _compose_domain_label(primary, secondary, taxonomy)
+    return label, label

@@ -11,8 +11,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
-from extractors import extract_title_abstract_body
+from extractors import extract_title_abstract_body, run_pdf_worker_cli
 from llm_client import identify_domain, clear_llm_context
 from csv_io import (
     load_processed_paths,
@@ -22,11 +23,43 @@ from csv_io import (
 )
 
 
+def _runtime_search_roots() -> list:
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(Path(meipass))
+    roots.append(Path.cwd())
+    return roots
+
+
+def _resolve_existing_path(raw_path: str) -> Path:
+    path_obj = Path(raw_path)
+    if path_obj.is_absolute():
+        return path_obj
+    for root in _runtime_search_roots():
+        candidate = (root / path_obj).resolve()
+        if candidate.exists():
+            return candidate
+    return path_obj
+
+
+def _normalize_cli_config_path(config_path: str) -> str:
+    if not config_path or config_path == "config.yaml":
+        return config_path
+    path_obj = Path(config_path).expanduser()
+    if path_obj.is_absolute():
+        return str(path_obj)
+    return str(path_obj.resolve())
+
+
 def load_config(config_path: str = "config.yaml") -> dict:
     """加载 YAML 配置。"""
     try:
         import yaml
-        p = Path(config_path)
+
+        p = _resolve_existing_path(config_path)
         if not p.exists():
             return _default_config()
         with open(p, "r", encoding="utf-8") as f:
@@ -38,23 +71,67 @@ def load_config(config_path: str = "config.yaml") -> dict:
 def _default_config() -> dict:
     return {
         "literature_dirs": ["./papers"],
-        "extensions": [".pdf", ".docx", ".doc", ".txt"],
+        "extensions": [".pdf"],
+        "taxonomy_path": "./taxonomy.yaml",
         "llm": {
-            "provider": "ollama",
-            "model": "qwen2.5:7b",
-            "api_base": "http://localhost:1234/v1",
-            "api_key": "not-needed",
-            "ollama_base": "http://localhost:11434",
+            "provider": "openai_api",
+            "model": "Qwen2.5-3B-Instruct",
+            "api_base": "http://127.0.0.1:1234/v1",
+            "api_key": "lm-studio",
+            "max_tokens": 64,
+            "temperature": 0.0,
+            "timeout": 60,
+            "stream": True,
+            "warmup": False,
         },
-        "max_chars_for_llm": 3000,
+        "max_chars_for_llm": 2000,
         "max_prompt_chars": 4096,
-        "clear_context_every_n": None,
+        "clear_context_every_n": 50,
         "output": {
             "csv_path": "./literature_domains.csv",
             "log_path": "./scan.log",
         },
         "concurrency": 1,
     }
+
+
+def load_taxonomy(taxonomy_path: str) -> Optional[dict]:
+    """Load optional taxonomy YAML for controlled two-stage classification."""
+    if not taxonomy_path:
+        return None
+    try:
+        import yaml
+
+        p = Path(taxonomy_path)
+        if not p.exists():
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _resolve_config_relative_path(config_path: str, raw_path: str) -> str:
+    """Resolve a relative path against the config file location."""
+    if not raw_path:
+        return raw_path
+    path_obj = Path(raw_path)
+    if path_obj.is_absolute():
+        return str(path_obj)
+
+    config_base = _resolve_existing_path(config_path)
+    if config_base.exists():
+        return str((config_base.parent / path_obj).resolve())
+
+    for root in _runtime_search_roots():
+        candidate = (root / path_obj).resolve()
+        if candidate.exists():
+            return str(candidate)
+
+    return str(path_obj)
 
 
 def setup_logging(log_path: str) -> logging.Logger:
@@ -115,10 +192,9 @@ def _process_one_file(fp: str, job_config: dict, log: logging.Logger) -> tuple:
         temperature=llm.get("temperature", 0.0),
         timeout=llm.get("timeout", 60),
         system_prompt=llm.get("system_prompt"),
-        preferred_domains=job_config.get("preferred_domains"),
         max_prompt_chars=job_config["max_prompt_chars"],
         stream=job_config.get("stream", True),
-        max_preferred_domains_in_prompt=job_config.get("max_preferred_domains_in_prompt"),
+        taxonomy=job_config.get("taxonomy"),
     )
     t_llm = time.perf_counter() - t1
     return fp, name, domain_cn, domain_en, t_extract, t_llm
@@ -127,19 +203,31 @@ def _process_one_file(fp: str, job_config: dict, log: logging.Logger) -> tuple:
 def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
     """根据配置扫描文献、识别领域并实时写入 CSV；支持断点续跑与运行日志。"""
     cfg = load_config(config_path)
-    dirs = cfg.get("literature_dirs", ["./papers"])
-    exts = cfg.get("extensions", [".pdf", ".docx", ".doc", ".txt"])
+    dirs = [
+        _resolve_config_relative_path(config_path, raw_dir)
+        for raw_dir in cfg.get("literature_dirs", ["./papers"])
+    ]
+    exts = cfg.get("extensions", [".pdf"])
     llm_cfg = cfg.get("llm", {})
     max_chars = cfg.get("max_chars_for_llm", 800)
     max_prompt_chars = cfg.get("max_prompt_chars", 4096)
     clear_context_every_n = cfg.get("clear_context_every_n")
+    taxonomy_path = _resolve_config_relative_path(
+        config_path,
+        cfg.get("taxonomy_path", "./taxonomy.yaml"),
+    )
     out = cfg.get("output", {})
-    csv_path = out.get("csv_path", "./literature_domains.csv")
-    log_path = out.get("log_path", "./scan.log")
+    csv_path = _resolve_config_relative_path(config_path, out.get("csv_path", "./literature_domains.csv"))
+    log_path = _resolve_config_relative_path(config_path, out.get("log_path", "./scan.log"))
     concurrency = max(1, int(cfg.get("concurrency", 1)))
+    taxonomy = load_taxonomy(taxonomy_path)
 
     log = setup_logging(log_path)
     log.info("日志文件: %s", log_path)
+    if taxonomy and isinstance(taxonomy.get("level1"), dict):
+        log.info("已加载 taxonomy: %s（一级领域 %d 个）", taxonomy_path, len(taxonomy["level1"]))
+    else:
+        log.warning("未加载有效 taxonomy: %s；当前版本将统一回退为“未分类”，请检查 taxonomy.yaml。", taxonomy_path)
 
     all_files = collect_files(dirs, exts)
     if not all_files:
@@ -164,9 +252,8 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
         "max_prompt_chars": max_prompt_chars,
         "provider": "mock" if use_mock else llm_cfg.get("provider", "ollama"),
         "llm_cfg": llm_cfg,
-        "preferred_domains": cfg.get("preferred_domains"),
         "stream": bool(cfg.get("llm", {}).get("stream", True)),
-        "max_preferred_domains_in_prompt": cfg.get("max_preferred_domains_in_prompt"),
+        "taxonomy": taxonomy,
     }
 
     writer = CsvWriterAsync(csv_path)
@@ -186,10 +273,9 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
                     temperature=llm_cfg.get("temperature", 0.0),
                     timeout=llm_cfg.get("timeout", 60),
                     system_prompt=llm_cfg.get("system_prompt"),
-                    preferred_domains=cfg.get("preferred_domains"),
                     max_prompt_chars=max_prompt_chars,
                     stream=job_config.get("stream", True),
-                    max_preferred_domains_in_prompt=cfg.get("max_preferred_domains_in_prompt"),
+                    taxonomy=taxonomy,
                 )
                 log.info("模型预热完成")
             except Exception as e:
@@ -243,7 +329,10 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
 def run_list_domains(config_path: str = "config.yaml") -> None:
     """列出 CSV 中所有出现过的领域。"""
     cfg = load_config(config_path)
-    csv_path = cfg.get("output", {}).get("csv_path", "./literature_domains.csv")
+    csv_path = _resolve_config_relative_path(
+        config_path,
+        cfg.get("output", {}).get("csv_path", "./literature_domains.csv"),
+    )
     if not Path(csv_path).exists():
         print("CSV 不存在，请先运行 scan。")
         return
@@ -256,7 +345,10 @@ def run_list_domains(config_path: str = "config.yaml") -> None:
 def run_query(domain: str, config_path: str = "config.yaml") -> None:
     """按领域筛选，打印该领域下的所有文献路径。"""
     cfg = load_config(config_path)
-    csv_path = cfg.get("output", {}).get("csv_path", "./literature_domains.csv")
+    csv_path = _resolve_config_relative_path(
+        config_path,
+        cfg.get("output", {}).get("csv_path", "./literature_domains.csv"),
+    )
     if not Path(csv_path).exists():
         print("CSV 不存在，请先运行 scan。")
         return
@@ -270,6 +362,9 @@ def run_query(domain: str, config_path: str = "config.yaml") -> None:
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "__pdf_worker__":
+        raise SystemExit(run_pdf_worker_cli(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(description="文献领域识别：用本地大模型打标签并实时写入 CSV，支持断点续跑")
     parser.add_argument("--config", "-c", default="config.yaml", help="配置文件路径")
     sub = parser.add_subparsers(dest="command", help="子命令")
@@ -281,18 +376,19 @@ def main():
     p_query.add_argument("domain", help="领域名称，如：计算机科学")
 
     args = parser.parse_args()
+    config_path = _normalize_cli_config_path(args.config)
     if args.command == "scan":
-        run_scan(args.config, use_mock=getattr(args, "mock", False))
+        run_scan(config_path, use_mock=getattr(args, "mock", False))
     elif args.command == "domains":
-        run_list_domains(args.config)
+        run_list_domains(config_path)
     elif args.command == "filter":
-        run_query(args.domain, args.config)
+        run_query(args.domain, config_path)
     else:
         parser.print_help()
         print("\n示例：")
         print("  python main.py scan              # 扫描并打标签（断点续跑）")
         print("  python main.py domains           # 查看所有领域")
-        print("  python main.py filter 计算机科学  # 筛选该领域文献")
+        print("  python main.py filter 土木工程/岩土工程  # 筛选该领域文献")
 
 
 if __name__ == "__main__":
