@@ -8,6 +8,7 @@ import argparse
 import gc
 import logging
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -75,16 +76,16 @@ def _default_config() -> dict:
         "taxonomy_path": "./taxonomy.yaml",
         "llm": {
             "provider": "openai_api",
-            "model": "Qwen2.5-3B-Instruct",
+            "model": "qwen2.5-7b-instruct-q4_k_m",
             "api_base": "http://127.0.0.1:1234/v1",
             "api_key": "lm-studio",
-            "max_tokens": 64,
+            "max_tokens": 32,
             "temperature": 0.0,
-            "timeout": 60,
-            "stream": True,
-            "warmup": False,
+            "timeout": 120,
+            "stream": False,
+            "warmup": True,
         },
-        "max_chars_for_llm": 2000,
+        "max_chars_for_llm": 1200,
         "max_prompt_chars": 4096,
         "clear_context_every_n": 50,
         "output": {
@@ -92,6 +93,9 @@ def _default_config() -> dict:
             "log_path": "./scan.log",
         },
         "concurrency": 1,
+        "llm_concurrency": 1,
+        "classification_retries": 0,
+        "taxonomy_fast_path": True,
     }
 
 
@@ -181,21 +185,27 @@ def _process_one_file(fp: str, job_config: dict, log: logging.Logger) -> tuple:
     t_extract = time.perf_counter() - t0
     t1 = time.perf_counter()
     llm = job_config["llm_cfg"]
-    domain_cn, domain_en = identify_domain(
-        title,
-        content_for_llm,
-        provider=job_config["provider"],
-        model=llm.get("model", "qwen2.5:7b"),
-        api_base=llm.get("api_base", "http://localhost:1234/v1"),
-        api_key=llm.get("api_key", "not-needed"),
-        max_tokens=llm.get("max_tokens", 128),
-        temperature=llm.get("temperature", 0.0),
-        timeout=llm.get("timeout", 60),
-        system_prompt=llm.get("system_prompt"),
-        max_prompt_chars=job_config["max_prompt_chars"],
-        stream=job_config.get("stream", True),
-        taxonomy=job_config.get("taxonomy"),
-    )
+    llm_kwargs = {
+        "provider": job_config["provider"],
+        "model": llm.get("model", "qwen2.5:7b"),
+        "api_base": llm.get("api_base", "http://localhost:1234/v1"),
+        "api_key": llm.get("api_key", "not-needed"),
+        "max_tokens": llm.get("max_tokens", 128),
+        "temperature": llm.get("temperature", 0.0),
+        "timeout": llm.get("timeout", 60),
+        "system_prompt": llm.get("system_prompt"),
+        "max_prompt_chars": job_config["max_prompt_chars"],
+        "stream": job_config.get("stream", True),
+        "taxonomy": job_config.get("taxonomy"),
+        "retries": job_config.get("classification_retries", 0),
+        "taxonomy_fast_path": job_config.get("taxonomy_fast_path", True),
+    }
+    llm_semaphore = job_config.get("llm_semaphore")
+    if llm_semaphore is None:
+        domain_cn, domain_en = identify_domain(title, content_for_llm, **llm_kwargs)
+    else:
+        with llm_semaphore:
+            domain_cn, domain_en = identify_domain(title, content_for_llm, **llm_kwargs)
     t_llm = time.perf_counter() - t1
     return fp, name, domain_cn, domain_en, t_extract, t_llm
 
@@ -220,6 +230,9 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
     csv_path = _resolve_config_relative_path(config_path, out.get("csv_path", "./literature_domains.csv"))
     log_path = _resolve_config_relative_path(config_path, out.get("log_path", "./scan.log"))
     concurrency = max(1, int(cfg.get("concurrency", 1)))
+    llm_concurrency = max(1, int(cfg.get("llm_concurrency", concurrency)))
+    classification_retries = max(0, int(cfg.get("classification_retries", 0)))
+    taxonomy_fast_path = bool(cfg.get("taxonomy_fast_path", True))
     taxonomy = load_taxonomy(taxonomy_path)
 
     log = setup_logging(log_path)
@@ -247,6 +260,16 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
     if concurrency > 1:
         log.info("并发数: %d", concurrency)
 
+    if not use_mock:
+        log.info(
+            "LLM concurrency: %d | classification retries: %d | taxonomy fast path: %s",
+            llm_concurrency,
+            classification_retries,
+            taxonomy_fast_path,
+        )
+
+    llm_semaphore = None if use_mock else threading.BoundedSemaphore(llm_concurrency)
+
     job_config = {
         "max_chars": max_chars,
         "max_prompt_chars": max_prompt_chars,
@@ -254,6 +277,9 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
         "llm_cfg": llm_cfg,
         "stream": bool(cfg.get("llm", {}).get("stream", True)),
         "taxonomy": taxonomy,
+        "llm_semaphore": llm_semaphore,
+        "classification_retries": classification_retries,
+        "taxonomy_fast_path": taxonomy_fast_path,
     }
 
     writer = CsvWriterAsync(csv_path)
@@ -276,6 +302,8 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
                     max_prompt_chars=max_prompt_chars,
                     stream=job_config.get("stream", True),
                     taxonomy=taxonomy,
+                    retries=classification_retries,
+                    taxonomy_fast_path=taxonomy_fast_path,
                 )
                 log.info("模型预热完成")
             except Exception as e:

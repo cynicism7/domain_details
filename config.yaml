@@ -1,37 +1,31 @@
 literature_dirs:
-  - "./papers"
+  - "D:/85500000解压好/libgen_scimag85501000-85501999_zip"
 
 extensions:
   - ".pdf"
 
-# 当前版本使用 taxonomy 驱动的两级分类。
-# 用户可直接修改本文件中的模型、输入长度和输出路径，
-# 也可编辑 taxonomy.yaml 自定义一级/二级领域及别名。
 llm:
   provider: "openai_api"
-  model: "Qwen2.5-3B-Instruct"
+  model: "qwen2.5-7b-instruct-q4_k_m"
   api_base: "http://127.0.0.1:1234/v1"
   api_key: "lm-studio"
-  max_tokens: 64
+  max_tokens: 32
   temperature: 0.0
-  timeout: 60
-  stream: true
-  warmup: false
-  # system_prompt: "你是分类器。禁止 <think>，只输出一行 {\"field\": \"学科名称\"}。"
+  timeout: 120
+  stream: false
+  warmup: true
+  # system_prompt: "Only output one JSON line: {\"field\": \"label\"}"
 
 taxonomy_path: "./taxonomy.yaml"
 
-# 送给模型的文本会优先包含：标题、关键词、摘要、引言片段，必要时补正文片段。
-max_chars_for_llm: 2000
-
-# 单次请求总字符数上限，避免本地模型上下文过长导致内存越界。
+max_chars_for_llm: 1200
 max_prompt_chars: 4096
-
-# 仅串行模式生效；显存够时可适当调大，减少频繁卸载。
 clear_context_every_n: 50
 
-# 需要服务端支持并发请求时再调高。
 concurrency: 1
+llm_concurrency: 1
+classification_retries: 0
+taxonomy_fast_path: true
 
 output:
   csv_path: "./literature_domains.csv"

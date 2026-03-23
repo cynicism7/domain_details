@@ -136,6 +136,9 @@ class CsvWriterAsync:
         self._q = queue.Queue()
         self._stop = threading.Event()
         self._effective_path_ref = [csv_path]
+        self._processed_paths = load_processed_paths(csv_path)
+        self._queued_paths: Set[str] = set()
+        self._lock = threading.Lock()
         _ensure_header(csv_path)
         self._thread = threading.Thread(
             target=_writer_loop,
@@ -146,7 +149,12 @@ class CsvWriterAsync:
 
     def put(self, file_path: str, file_name: str, domain_cn: str, domain_en: str) -> None:
         """将一条结果放入队列，由后台线程写入，不阻塞。"""
-        self._q.put((file_path, file_name, domain_cn or "", domain_en or ""))
+        resolved_path = str(Path(file_path).resolve())
+        with self._lock:
+            if resolved_path in self._processed_paths or resolved_path in self._queued_paths:
+                return
+            self._queued_paths.add(resolved_path)
+        self._q.put((resolved_path, file_name, domain_cn or "", domain_en or ""))
 
     def close(self) -> None:
         """结束后台线程（等待队列写完）。"""

@@ -3,10 +3,12 @@
 
 import json
 import re
+import threading
 from typing import Dict, List, Optional, Tuple
 
 # Streamed responses can stop early once a valid field JSON appears.
 _FIELD_JSON_PATTERN = re.compile(r'\{\s*"field"\s*:\s*"[^"]*"\s*\}')
+_OPENAI_CLIENTS = threading.local()
 
 
 def _normalize_domain(raw: str) -> str:
@@ -122,11 +124,10 @@ def ask_openai_api(
 ) -> str:
     """Request a chat completion from an OpenAI-compatible local API."""
     try:
-        from openai import OpenAI
+        client = _get_openai_client(api_base, api_key)
     except ImportError:
         return "[未安装 openai 包]"
 
-    client = OpenAI(base_url=api_base, api_key=api_key)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -176,6 +177,22 @@ DEFAULT_SYSTEM_PROMPT = """你是文献领域分类器。
 你只需要做标签选择，不需要输出推理过程。
 禁止使用 <think> 或任何思考标签，不要输出解释。
 始终只输出一行 JSON：{"field": "标签名"}。"""
+
+def _get_openai_client(api_base: str, api_key: str):
+    from openai import OpenAI
+
+    cache = getattr(_OPENAI_CLIENTS, "by_base", None)
+    if cache is None:
+        cache = {}
+        _OPENAI_CLIENTS.by_base = cache
+
+    cache_key = (api_base.rstrip("/"), api_key)
+    client = cache.get(cache_key)
+    if client is None:
+        client = OpenAI(base_url=api_base, api_key=api_key)
+        cache[cache_key] = client
+    return client
+
 
 DEFAULT_MAX_PROMPT_CHARS = 4096
 
@@ -511,6 +528,24 @@ def _uncategorized_result(taxonomy: Optional[dict]) -> Tuple[str, str]:
     return _taxonomy_default_label(taxonomy), "Uncategorized"
 
 
+def _resolve_with_retries(
+    prompt: str,
+    candidates: List[str],
+    alias_map: Optional[Dict[str, str]],
+    call_fn,
+    retries: int,
+) -> Optional[str]:
+    for _ in range(max(0, retries) + 1):
+        raw = call_fn(prompt)
+        field = _parse_field_value(raw)
+        if not field:
+            continue
+        resolved = _resolve_candidate(field, candidates, alias_map)
+        if resolved:
+            return resolved
+    return None
+
+
 def _taxonomy_identify(
     title: str,
     content: str,
@@ -526,10 +561,20 @@ def _taxonomy_identify(
     max_prompt_chars: int,
     stream: bool,
     taxonomy: dict,
+    retries: int,
+    taxonomy_fast_path: bool,
 ) -> Tuple[str, str]:
     default_label = _taxonomy_default_label(taxonomy)
     default_secondary = _taxonomy_default_secondary_label(taxonomy)
     level1_candidates = _taxonomy_level1_candidates(taxonomy)
+    combined_text = title + "\n" + content
+
+    title_primary = _guess_primary_from_taxonomy(title, taxonomy) if taxonomy_fast_path else None
+    if title_primary and title_primary != default_label:
+        title_secondary = _guess_secondary_from_taxonomy(title, taxonomy, title_primary)
+        if title_secondary:
+            label = _compose_domain_label(title_primary, title_secondary, taxonomy)
+            return label, label
 
     prompt_level1 = _build_level1_prompt(
         title,
@@ -554,19 +599,18 @@ def _taxonomy_identify(
             stream=stream,
         )
 
-    primary = None
-    raw_primary = _call(prompt_level1)
-    field_primary = _parse_field_value(raw_primary)
-    if field_primary:
-        primary = _resolve_candidate(field_primary, level1_candidates, _taxonomy_primary_aliases(taxonomy))
+    primary = title_primary
     if not primary:
-        raw_primary_2 = _call(prompt_level1)
-        field_primary = _parse_field_value(raw_primary_2)
-        if field_primary:
-            primary = _resolve_candidate(field_primary, level1_candidates, _taxonomy_primary_aliases(taxonomy))
+        primary = _resolve_with_retries(
+            prompt_level1,
+            level1_candidates,
+            _taxonomy_primary_aliases(taxonomy),
+            _call,
+            retries,
+        )
 
     if not primary:
-        primary = _guess_primary_from_taxonomy(title + "\n" + content, taxonomy) or default_label
+        primary = _guess_primary_from_taxonomy(combined_text, taxonomy) or default_label
 
     if primary == default_label:
         return default_label, "Uncategorized"
@@ -582,19 +626,18 @@ def _taxonomy_identify(
         default_secondary,
     )
 
-    secondary = None
-    raw_secondary = _call(prompt_level2)
-    field_secondary = _parse_field_value(raw_secondary)
-    if field_secondary:
-        secondary = _resolve_candidate(field_secondary, level2_candidates, _taxonomy_secondary_aliases(taxonomy, primary))
+    secondary = _guess_secondary_from_taxonomy(title, taxonomy, primary) if taxonomy_fast_path else None
     if not secondary:
-        raw_secondary_2 = _call(prompt_level2)
-        field_secondary = _parse_field_value(raw_secondary_2)
-        if field_secondary:
-            secondary = _resolve_candidate(field_secondary, level2_candidates, _taxonomy_secondary_aliases(taxonomy, primary))
+        secondary = _resolve_with_retries(
+            prompt_level2,
+            level2_candidates,
+            _taxonomy_secondary_aliases(taxonomy, primary),
+            _call,
+            retries,
+        )
 
     if not secondary:
-        secondary = _guess_secondary_from_taxonomy(title + "\n" + content, taxonomy, primary) or default_secondary
+        secondary = _guess_secondary_from_taxonomy(combined_text, taxonomy, primary) or default_secondary
 
     label = _compose_domain_label(primary, secondary, taxonomy)
     return label, label
@@ -615,6 +658,8 @@ def identify_domain(
     max_prompt_chars: Optional[int] = None,
     stream: bool = False,
     taxonomy: Optional[dict] = None,
+    retries: int = 1,
+    taxonomy_fast_path: bool = True,
 ) -> Tuple[str, str]:
     """
     Identify the best-fitting domain label for a paper.
@@ -646,6 +691,8 @@ def identify_domain(
         max_prompt_chars=cap,
         stream=stream,
         taxonomy=taxonomy,
+        retries=retries,
+        taxonomy_fast_path=taxonomy_fast_path,
     )
 
 
