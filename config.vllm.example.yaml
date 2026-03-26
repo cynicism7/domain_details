@@ -1,0 +1,45 @@
+path_mapping:
+  physical_root: "D:/library_root"
+  logical_root: "library_root"
+
+literature_dirs:
+  - "./papers"
+
+extensions:
+  - ".pdf"
+
+llm:
+  provider: "openai_api"
+  model: "paper-domain"
+  api_base: "http://127.0.0.1:8000/v1"
+  api_key: "EMPTY"
+  max_tokens: 8
+  temperature: 0.0
+  timeout: 120
+  stream: false
+  warmup: true
+  choice_constraints: true
+  extra_body:
+    top_k: 1
+    # chat_template_kwargs:
+    #   enable_thinking: false
+
+taxonomy_path: "./taxonomy.yaml"
+max_chars_for_llm: 1200
+max_prompt_chars: 4096
+clear_context_every_n: 0
+min_content_chars_for_classification: 120
+
+concurrency: 2
+extract_concurrency: 2
+llm_concurrency: 8
+classification_retries: 1
+taxonomy_fast_path: true
+
+output:
+  csv_path: "./literature_domains.csv"
+  log_path: "./scan.log"
+  include_csv_diagnostics: false
+  include_csv_timing: false
+  log_include_diagnostics: true
+  log_include_timing: true

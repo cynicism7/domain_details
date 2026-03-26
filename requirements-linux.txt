@@ -1,0 +1,27 @@
+# Linux runtime dependencies for source deployment of this project.
+#
+# Recommended install flow:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   python -m pip install -U pip uv
+#   python -m pip install -r requirements-linux.txt
+#
+# If vLLM installation fails in your environment, install it separately
+# following the official GPU installation guide, for example:
+#   uv pip install vllm --torch-backend=auto
+#
+# System packages still needed outside pip:
+#   sudo apt install -y tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng
+
+openai>=1.30.0
+requests>=2.31.0
+PyYAML>=6.0.1
+pypdf>=4.2.0
+PyMuPDF>=1.24.0
+Pillow>=10.2.0
+pytesseract>=0.3.10
+huggingface_hub[cli]>=0.23.0
+vllm>=0.5.0
+
+# Packaging is handled by scripts/linux/build_linux.sh, which installs
+# PyInstaller only when needed.

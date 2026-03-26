@@ -7,12 +7,12 @@
 import argparse
 import gc
 import logging
+import queue
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from extractors import extract_title_abstract_body, run_pdf_worker_cli
 from llm_client import identify_domain, clear_llm_context
@@ -20,8 +20,22 @@ from csv_io import (
     load_processed_paths,
     CsvWriterAsync,
     list_domains_from_csv,
+    normalize_csv_file_paths,
     query_by_domain_from_csv,
 )
+
+EXTRACTION_FAILURE_PRIMARY = "提取失败"
+EXTRACTION_FAILURE_EN = "ExtractionFailure"
+DEFAULT_MIN_CONTENT_CHARS = 120
+DIAGNOSTIC_FIELD_ORDER = [
+    "extract_source",
+    "raw_text_len",
+    "content_len",
+    "ocr_used",
+    "extract_timeout",
+    "extract_seconds",
+    "model_seconds",
+]
 
 
 def _runtime_search_roots() -> list:
@@ -71,6 +85,10 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 def _default_config() -> dict:
     return {
+        "path_mapping": {
+            "physical_root": "",
+            "logical_root": "",
+        },
         "literature_dirs": ["./papers"],
         "extensions": [".pdf"],
         "taxonomy_path": "./taxonomy.yaml",
@@ -84,6 +102,8 @@ def _default_config() -> dict:
             "timeout": 120,
             "stream": False,
             "warmup": True,
+            "choice_constraints": False,
+            "extra_body": {},
         },
         "max_chars_for_llm": 1200,
         "max_prompt_chars": 4096,
@@ -91,11 +111,17 @@ def _default_config() -> dict:
         "output": {
             "csv_path": "./literature_domains.csv",
             "log_path": "./scan.log",
+            "include_csv_diagnostics": False,
+            "include_csv_timing": False,
+            "log_include_diagnostics": True,
+            "log_include_timing": True,
         },
         "concurrency": 1,
+        "extract_concurrency": 1,
         "llm_concurrency": 1,
         "classification_retries": 0,
         "taxonomy_fast_path": True,
+        "min_content_chars_for_classification": DEFAULT_MIN_CONTENT_CHARS,
     }
 
 
@@ -138,6 +164,98 @@ def _resolve_config_relative_path(config_path: str, raw_path: str) -> str:
     return str(path_obj)
 
 
+def _split_normalized_parts(raw_path: str) -> list:
+    text = str(raw_path or "").strip().replace("\\", "/")
+    return [part for part in text.split("/") if part not in ("", ".")]
+
+
+def _normalize_logical_root(raw_root: str) -> str:
+    return "/".join(_split_normalized_parts(raw_root))
+
+
+def _join_logical_path(logical_root: str, relative_path: str = "") -> str:
+    parts = _split_normalized_parts(logical_root)
+    parts.extend(_split_normalized_parts(relative_path))
+    return "/".join(parts)
+
+
+def _extract_logical_path_from_raw(raw_path: str, logical_root: str) -> Optional[str]:
+    root_parts = _split_normalized_parts(logical_root)
+    if not root_parts:
+        return None
+    raw_parts = _split_normalized_parts(raw_path)
+    if len(raw_parts) < len(root_parts):
+        return None
+
+    target = [part.casefold() for part in root_parts]
+    for idx in range(len(raw_parts) - len(root_parts) + 1):
+        window = [part.casefold() for part in raw_parts[idx : idx + len(root_parts)]]
+        if window == target:
+            suffix = raw_parts[idx + len(root_parts) :]
+            return "/".join(root_parts + suffix)
+    return None
+
+
+def _load_path_mapping(config_path: str, cfg: dict) -> dict:
+    mapping = cfg.get("path_mapping", {}) or {}
+    if not isinstance(mapping, dict):
+        mapping = {}
+
+    physical_root = None
+    raw_physical_root = mapping.get("physical_root", "")
+    if raw_physical_root:
+        physical_root = Path(_resolve_config_relative_path(config_path, raw_physical_root)).resolve()
+
+    logical_root = _normalize_logical_root(mapping.get("logical_root", ""))
+    if physical_root is not None and not logical_root:
+        logical_root = physical_root.name
+
+    return {
+        "physical_root": physical_root,
+        "logical_root": logical_root,
+    }
+
+
+def _resolve_literature_dir(config_path: str, raw_dir: str, path_mapping: dict) -> str:
+    if not raw_dir:
+        return raw_dir
+    path_obj = Path(raw_dir).expanduser()
+    if path_obj.is_absolute():
+        return str(path_obj.resolve())
+
+    physical_root = path_mapping.get("physical_root")
+    if physical_root is not None:
+        return str((physical_root / path_obj).resolve())
+
+    return _resolve_config_relative_path(config_path, raw_dir)
+
+
+def _stored_file_path(raw_path: str, path_mapping: dict) -> str:
+    raw_text = str(raw_path or "").strip()
+    if not raw_text:
+        return ""
+
+    logical_root = path_mapping.get("logical_root", "")
+    logical_candidate = _extract_logical_path_from_raw(raw_text, logical_root)
+    if logical_candidate:
+        return logical_candidate
+
+    path_obj = Path(raw_text).expanduser()
+    physical_root = path_mapping.get("physical_root")
+    if physical_root is not None:
+        try:
+            relative = path_obj.resolve().relative_to(physical_root)
+        except Exception:
+            pass
+        else:
+            return _join_logical_path(logical_root, relative.as_posix())
+
+    if logical_root and not path_obj.is_absolute():
+        return _join_logical_path(logical_root, raw_text)
+
+    return str(path_obj.resolve())
+
+
 def setup_logging(log_path: str) -> logging.Logger:
     """配置运行日志：同时输出到文件与控制台，报错带堆栈。"""
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -175,17 +293,87 @@ def collect_files(dirs: list, extensions: list) -> list:
     return sorted(set(collected))
 
 
-def _process_one_file(fp: str, job_config: dict, log: logging.Logger) -> tuple:
-    """单篇文献：提取 + 领域识别，返回 (file_path, file_name, domain_cn, domain_en, 提取秒数, 模型秒数)。"""
-    name = Path(fp).name
-    t0 = time.perf_counter()
-    title, content_for_llm, _ = extract_title_abstract_body(
-        fp, max_chars_for_llm=job_config["max_chars"]
-    )
-    t_extract = time.perf_counter() - t0
-    t1 = time.perf_counter()
+def _normalize_output_flags(output_cfg: dict) -> dict:
+    # Backward compatible defaults:
+    # - diagnostics / timing are shown in log by default
+    # - CSV stays in the original compact format unless explicitly enabled
+    base_diag = bool(output_cfg.get("include_diagnostics", True))
+    base_timing = bool(output_cfg.get("include_timing", True))
+    return {
+        "include_csv_diagnostics": bool(output_cfg.get("include_csv_diagnostics", False)),
+        "include_csv_timing": bool(output_cfg.get("include_csv_timing", False)),
+        "log_include_diagnostics": bool(output_cfg.get("log_include_diagnostics", base_diag)),
+        "log_include_timing": bool(output_cfg.get("log_include_timing", base_timing)),
+    }
+
+
+def _build_csv_headers(output_flags: dict) -> list:
+    headers = ["file_path", "file_name", "domain_cn", "domain_en", "updated_at"]
+    if output_flags["include_csv_diagnostics"]:
+        headers.extend(["extract_source", "raw_text_len", "content_len", "ocr_used", "extract_timeout"])
+    if output_flags["include_csv_timing"]:
+        headers.extend(["extract_seconds", "model_seconds"])
+    return headers
+
+
+def _build_row_extra_fields(result: dict, output_flags: dict) -> Dict[str, object]:
+    meta = result.get("extract_meta") or {}
+    extra: Dict[str, object] = {}
+    if output_flags["include_csv_diagnostics"]:
+        extra.update({
+            "extract_source": meta.get("extract_source", ""),
+            "raw_text_len": meta.get("raw_text_len", 0),
+            "content_len": meta.get("content_len", 0),
+            "ocr_used": bool(meta.get("ocr_used", False)),
+            "extract_timeout": bool(meta.get("extract_timeout", False)),
+        })
+    if output_flags["include_csv_timing"]:
+        extra.update({
+            "extract_seconds": f"{result.get('t_extract', 0.0):.2f}",
+            "model_seconds": f"{result.get('t_llm', 0.0):.2f}",
+        })
+    return extra
+
+
+def _format_result_log(done: int, total: int, result: dict, output_flags: dict) -> str:
+    line = f"[{done}/{total}] {result['file_name']} -> {result['domain_cn']} | {result['domain_en']}"
+    if output_flags["log_include_timing"]:
+        line += f"  (提取{result.get('t_extract', 0.0):.2f}s 模型{result.get('t_llm', 0.0):.2f}s)"
+    if output_flags["log_include_diagnostics"]:
+        meta = result.get("extract_meta") or {}
+        line += (
+            " [source={source} raw={raw} content={content} ocr={ocr} timeout={timeout}]"
+        ).format(
+            source=meta.get("extract_source", ""),
+            raw=meta.get("raw_text_len", 0),
+            content=meta.get("content_len", 0),
+            ocr=bool(meta.get("ocr_used", False)),
+            timeout=bool(meta.get("extract_timeout", False)),
+        )
+    return line
+
+
+def _extraction_failure_result(extract_meta: dict) -> tuple:
+    if extract_meta.get("extract_timeout"):
+        return "提取失败/提取超时", f"{EXTRACTION_FAILURE_EN}/Timeout"
+    if extract_meta.get("raw_text_len", 0) <= 0:
+        if extract_meta.get("ocr_used"):
+            return "提取失败/OCR无结果", f"{EXTRACTION_FAILURE_EN}/NoTextAfterOCR"
+        return "提取失败/无有效文本", f"{EXTRACTION_FAILURE_EN}/NoText"
+    return "提取失败/文本不足", f"{EXTRACTION_FAILURE_EN}/InsufficientContent"
+
+
+def _should_mark_extract_failure(extract_meta: dict, min_content_chars: int) -> bool:
+    if extract_meta.get("extract_timeout"):
+        return True
+    if int(extract_meta.get("raw_text_len", 0) or 0) <= 0:
+        return True
+    return int(extract_meta.get("content_len", 0) or 0) < max(1, min_content_chars)
+
+
+def _build_llm_kwargs(job_config: dict) -> dict:
     llm = job_config["llm_cfg"]
-    llm_kwargs = {
+    return {
         "provider": job_config["provider"],
         "model": llm.get("model", "qwen2.5:7b"),
         "api_base": llm.get("api_base", "http://localhost:1234/v1"),
@@ -199,22 +387,86 @@ def _process_one_file(fp: str, job_config: dict, log: logging.Logger) -> tuple:
         "taxonomy": job_config.get("taxonomy"),
         "retries": job_config.get("classification_retries", 0),
         "taxonomy_fast_path": job_config.get("taxonomy_fast_path", True),
+        "choice_constraints": bool(llm.get("choice_constraints", False)),
+        "extra_body": llm.get("extra_body") if isinstance(llm.get("extra_body"), dict) else None,
     }
-    llm_semaphore = job_config.get("llm_semaphore")
-    if llm_semaphore is None:
-        domain_cn, domain_en = identify_domain(title, content_for_llm, **llm_kwargs)
-    else:
-        with llm_semaphore:
-            domain_cn, domain_en = identify_domain(title, content_for_llm, **llm_kwargs)
-    t_llm = time.perf_counter() - t1
-    return fp, name, domain_cn, domain_en, t_extract, t_llm
+
+
+def _extract_one_file(fp: str, job_config: dict) -> dict:
+    name = Path(fp).name
+    t0 = time.perf_counter()
+    title, content_for_llm, extract_meta = extract_title_abstract_body(
+        fp, max_chars_for_llm=job_config["max_chars"]
+    )
+    t_extract = time.perf_counter() - t0
+    return {
+        "file_path": fp,
+        "file_name": name,
+        "title": title or "",
+        "content": content_for_llm or "",
+        "extract_meta": extract_meta or {},
+        "t_extract": t_extract,
+    }
+
+
+def _classify_extracted(item: dict, job_config: dict) -> dict:
+    result = dict(item)
+    extract_meta = result.get("extract_meta") or {}
+    if _should_mark_extract_failure(extract_meta, job_config["min_content_chars_for_classification"]):
+        domain_cn, domain_en = _extraction_failure_result(extract_meta)
+        result.update({"domain_cn": domain_cn, "domain_en": domain_en, "t_llm": 0.0})
+        return result
+
+    if job_config["provider"] == "mock":
+        domain_cn, domain_en = identify_domain(
+            result.get("title", ""),
+            result.get("content", ""),
+            provider="mock",
+            taxonomy=job_config.get("taxonomy"),
+        )
+        result.update({"domain_cn": domain_cn, "domain_en": domain_en, "t_llm": 0.0})
+        return result
+
+    t1 = time.perf_counter()
+    domain_cn, domain_en = identify_domain(
+        result.get("title", ""),
+        result.get("content", ""),
+        **_build_llm_kwargs(job_config),
+    )
+    result.update({
+        "domain_cn": domain_cn,
+        "domain_en": domain_en,
+        "t_llm": time.perf_counter() - t1,
+    })
+    return result
+
+
+def _failure_result(file_path: str, file_name: str, message: str, extract_meta: Optional[dict] = None, t_extract: float = 0.0) -> dict:
+    return {
+        "file_path": file_path,
+        "file_name": file_name,
+        "domain_cn": "处理失败",
+        "domain_en": (message or "处理失败")[:200],
+        "extract_meta": extract_meta or {
+            "extract_source": "empty",
+            "raw_text_len": 0,
+            "content_len": 0,
+            "ocr_used": False,
+            "extract_timeout": False,
+        },
+        "t_extract": t_extract,
+        "t_llm": 0.0,
+    }
 
 
 def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
     """根据配置扫描文献、识别领域并实时写入 CSV；支持断点续跑与运行日志。"""
     cfg = load_config(config_path)
+    path_mapping = _load_path_mapping(config_path, cfg)
+    if path_mapping["physical_root"] is not None and not path_mapping["physical_root"].exists():
+        raise FileNotFoundError(f'Configured physical_root does not exist: {path_mapping["physical_root"]}')
     dirs = [
-        _resolve_config_relative_path(config_path, raw_dir)
+        _resolve_literature_dir(config_path, raw_dir, path_mapping)
         for raw_dir in cfg.get("literature_dirs", ["./papers"])
     ]
     exts = cfg.get("extensions", [".pdf"])
@@ -227,15 +479,28 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
         cfg.get("taxonomy_path", "./taxonomy.yaml"),
     )
     out = cfg.get("output", {})
+    output_flags = _normalize_output_flags(out)
     csv_path = _resolve_config_relative_path(config_path, out.get("csv_path", "./literature_domains.csv"))
     log_path = _resolve_config_relative_path(config_path, out.get("log_path", "./scan.log"))
     concurrency = max(1, int(cfg.get("concurrency", 1)))
+    extract_concurrency = max(1, int(cfg.get("extract_concurrency", concurrency)))
     llm_concurrency = max(1, int(cfg.get("llm_concurrency", concurrency)))
     classification_retries = max(0, int(cfg.get("classification_retries", 0)))
     taxonomy_fast_path = bool(cfg.get("taxonomy_fast_path", True))
+    min_content_chars = max(1, int(cfg.get("min_content_chars_for_classification", DEFAULT_MIN_CONTENT_CHARS)))
     taxonomy = load_taxonomy(taxonomy_path)
 
     log = setup_logging(log_path)
+    if path_mapping["physical_root"] is not None:
+        log.info("physical root: %s", path_mapping["physical_root"])
+    if path_mapping["logical_root"]:
+        log.info("logical root: %s", path_mapping["logical_root"])
+        normalized_count = normalize_csv_file_paths(
+            csv_path,
+            path_normalizer=lambda raw_path: _stored_file_path(raw_path, path_mapping),
+        )
+        if normalized_count > 0:
+            log.info("normalized existing CSV paths: %d", normalized_count)
     log.info("日志文件: %s", log_path)
     if taxonomy and isinstance(taxonomy.get("level1"), dict):
         log.info("已加载 taxonomy: %s（一级领域 %d 个）", taxonomy_path, len(taxonomy["level1"]))
@@ -247,8 +512,11 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
         log.warning("未找到任何文献文件，请检查 config.yaml 中的 literature_dirs 与 extensions。")
         return
 
-    done_paths = load_processed_paths(csv_path)
-    files = [f for f in all_files if str(Path(f).resolve()) not in done_paths]
+    done_paths = load_processed_paths(
+        csv_path,
+        path_normalizer=lambda raw_path: _stored_file_path(raw_path, path_mapping),
+    )
+    files = [f for f in all_files if _stored_file_path(f, path_mapping) not in done_paths]
     if not files:
         log.info("所有文献已处理完毕，无需继续。")
         return
@@ -257,18 +525,16 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
 
     if use_mock:
         log.info("【模拟模式】未调用大模型，使用简单规则生成领域标签。")
-    if concurrency > 1:
-        log.info("并发数: %d", concurrency)
+    log.info("提取并发: %d | 模型并发: %d", extract_concurrency, llm_concurrency)
 
     if not use_mock:
         log.info(
-            "LLM concurrency: %d | classification retries: %d | taxonomy fast path: %s",
-            llm_concurrency,
+            "classification retries: %d | taxonomy fast path: %s | choice constraints: %s | min content chars: %d",
             classification_retries,
             taxonomy_fast_path,
+            bool(llm_cfg.get("choice_constraints", False)),
+            min_content_chars,
         )
-
-    llm_semaphore = None if use_mock else threading.BoundedSemaphore(llm_concurrency)
 
     job_config = {
         "max_chars": max_chars,
@@ -277,12 +543,16 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
         "llm_cfg": llm_cfg,
         "stream": bool(cfg.get("llm", {}).get("stream", True)),
         "taxonomy": taxonomy,
-        "llm_semaphore": llm_semaphore,
         "classification_retries": classification_retries,
         "taxonomy_fast_path": taxonomy_fast_path,
+        "min_content_chars_for_classification": min_content_chars,
     }
 
-    writer = CsvWriterAsync(csv_path)
+    writer = CsvWriterAsync(
+        csv_path,
+        headers=_build_csv_headers(output_flags),
+        path_normalizer=lambda raw_path: _stored_file_path(raw_path, path_mapping),
+    )
     total = len(files)
     try:
         if not use_mock and llm_cfg.get("warmup", False):
@@ -304,50 +574,102 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
                     taxonomy=taxonomy,
                     retries=classification_retries,
                     taxonomy_fast_path=taxonomy_fast_path,
+                    choice_constraints=bool(llm_cfg.get("choice_constraints", False)),
+                    extra_body=llm_cfg.get("extra_body") if isinstance(llm_cfg.get("extra_body"), dict) else None,
                 )
                 log.info("模型预热完成")
             except Exception as e:
                 log.debug("预热请求忽略: %s", e)
-        if concurrency <= 1:
-            provider = job_config["provider"]
-            for i, fp in enumerate(files, 1):
-                name = Path(fp).name
-                log.info("[%d/%d] %s ... ", i, total, name)
+        file_queue: "queue.Queue[str]" = queue.Queue()
+        classify_queue: "queue.Queue[Optional[dict]]" = queue.Queue(maxsize=max(4, llm_concurrency * 2))
+        for fp in files:
+            file_queue.put(fp)
+
+        done_lock = threading.Lock()
+        done_count = {"value": 0}
+
+        def emit_result(result: dict) -> None:
+            writer.put(
+                result["file_path"],
+                result["file_name"],
+                result["domain_cn"],
+                result["domain_en"],
+                extra_fields=_build_row_extra_fields(result, output_flags),
+            )
+            with done_lock:
+                done_count["value"] += 1
+                current = done_count["value"]
+            log.info(_format_result_log(current, total, result, output_flags))
+            if current % 50 == 0:
+                gc.collect()
+
+        def extractor_worker() -> None:
+            while True:
                 try:
-                    fp, name, domain_cn, domain_en, t_extract, t_llm = _process_one_file(fp, job_config, log)
-                    writer.put(fp, name, domain_cn, domain_en)
-                    log.info("%s | %s  (提取%.2fs 模型%.2fs)", domain_cn, domain_en, t_extract, t_llm)
-                except Exception as e:
-                    log.exception("处理失败 [%s]: %s", fp, e)
-                    writer.put(fp, name, "处理失败", str(e)[:200])
-                if i % 50 == 0:
-                    gc.collect()
-                if clear_context_every_n and i % clear_context_every_n == 0 and i > 0:
-                    clear_llm_context(
-                        provider=provider,
-                        model=llm_cfg.get("model", "qwen2.5:7b"),
-                        api_base=llm_cfg.get("api_base", "http://localhost:1234/v1"),
-                        api_key=llm_cfg.get("api_key", "not-needed"),
-                    )
-        else:
-            done = 0
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = {executor.submit(_process_one_file, fp, job_config, log): fp for fp in files}
-                for fut in as_completed(futures):
-                    fp = futures[fut]
+                    fp = file_queue.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    classify_queue.put(_extract_one_file(fp, job_config))
+                except Exception as exc:
                     name = Path(fp).name
-                    try:
-                        _, name, domain_cn, domain_en, t_extract, t_llm = fut.result()
-                        writer.put(fp, name, domain_cn, domain_en)
-                        done += 1
-                        log.info("[%d/%d] %s -> %s | %s  (提取%.2fs 模型%.2fs)", done, total, name, domain_cn, domain_en, t_extract, t_llm)
-                    except Exception as e:
-                        log.exception("处理失败 [%s]: %s", fp, e)
-                        writer.put(fp, name, "处理失败", str(e)[:200])
-                        done += 1
-                    if done % 50 == 0:
-                        gc.collect()
-            # 并发模式下不调用 clear_llm_context（卸载会影响所有 worker）
+                    log.exception("提取失败 [%s]: %s", fp, exc)
+                    emit_result(_failure_result(fp, name, str(exc)))
+                finally:
+                    file_queue.task_done()
+
+        def classifier_worker() -> None:
+            while True:
+                item = classify_queue.get()
+                if item is None:
+                    classify_queue.task_done()
+                    break
+                try:
+                    emit_result(_classify_extracted(item, job_config))
+                except Exception as exc:
+                    log.exception("处理失败 [%s]: %s", item.get("file_path"), exc)
+                    emit_result(
+                        _failure_result(
+                            item.get("file_path", ""),
+                            item.get("file_name", ""),
+                            str(exc),
+                            extract_meta=item.get("extract_meta"),
+                            t_extract=float(item.get("t_extract", 0.0)),
+                        )
+                    )
+                finally:
+                    classify_queue.task_done()
+
+        extract_threads = [
+            threading.Thread(target=extractor_worker, name=f"extract-{i+1}", daemon=True)
+            for i in range(extract_concurrency)
+        ]
+        classify_threads = [
+            threading.Thread(target=classifier_worker, name=f"classify-{i+1}", daemon=True)
+            for i in range(llm_concurrency)
+        ]
+
+        for thread in classify_threads:
+            thread.start()
+        for thread in extract_threads:
+            thread.start()
+
+        for thread in extract_threads:
+            thread.join()
+
+        for _ in classify_threads:
+            classify_queue.put(None)
+
+        for thread in classify_threads:
+            thread.join()
+
+        if clear_context_every_n and not use_mock:
+            clear_llm_context(
+                provider=job_config["provider"],
+                model=llm_cfg.get("model", "qwen2.5:7b"),
+                api_base=llm_cfg.get("api_base", "http://localhost:1234/v1"),
+                api_key=llm_cfg.get("api_key", "not-needed"),
+            )
     finally:
         writer.close()
 
@@ -357,6 +679,7 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
 def run_list_domains(config_path: str = "config.yaml") -> None:
     """列出 CSV 中所有出现过的领域。"""
     cfg = load_config(config_path)
+    path_mapping = _load_path_mapping(config_path, cfg)
     csv_path = _resolve_config_relative_path(
         config_path,
         cfg.get("output", {}).get("csv_path", "./literature_domains.csv"),
@@ -364,6 +687,11 @@ def run_list_domains(config_path: str = "config.yaml") -> None:
     if not Path(csv_path).exists():
         print("CSV 不存在，请先运行 scan。")
         return
+    if path_mapping["logical_root"]:
+        normalize_csv_file_paths(
+            csv_path,
+            path_normalizer=lambda raw_path: _stored_file_path(raw_path, path_mapping),
+        )
     domains = list_domains_from_csv(csv_path)
     print("已记录的领域：")
     for d in domains:
@@ -373,6 +701,7 @@ def run_list_domains(config_path: str = "config.yaml") -> None:
 def run_query(domain: str, config_path: str = "config.yaml") -> None:
     """按领域筛选，打印该领域下的所有文献路径。"""
     cfg = load_config(config_path)
+    path_mapping = _load_path_mapping(config_path, cfg)
     csv_path = _resolve_config_relative_path(
         config_path,
         cfg.get("output", {}).get("csv_path", "./literature_domains.csv"),
@@ -380,6 +709,11 @@ def run_query(domain: str, config_path: str = "config.yaml") -> None:
     if not Path(csv_path).exists():
         print("CSV 不存在，请先运行 scan。")
         return
+    if path_mapping["logical_root"]:
+        normalize_csv_file_paths(
+            csv_path,
+            path_normalizer=lambda raw_path: _stored_file_path(raw_path, path_mapping),
+        )
     rows = query_by_domain_from_csv(csv_path, domain)
     if not rows:
         print(f"领域「{domain}」下没有文献。")

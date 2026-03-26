@@ -7,12 +7,17 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 MIN_TEXT_THRESHOLD = 200
+OCR_TRIGGER_TEXT_THRESHOLD = 80
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 100
-PDF_WORKER_TIMEOUT_SEC = 300
+PYPDF_WORKER_TIMEOUT_SEC = 20
+FITZ_TEXT_WORKER_TIMEOUT_SEC = 25
+OCR_WORKER_TIMEOUT_SEC = 25
+OCR_MAX_PAGES = 2
+OCR_RENDER_SCALE = 1.25
 
 TITLE_MAX_CHARS = 220
 AUTHOR_MAX_CHARS = 220
@@ -21,6 +26,16 @@ KEYWORDS_MAX_CHARS = 260
 ABSTRACT_MAX_CHARS = 900
 INTRO_MAX_CHARS = 1200
 BODY_FALLBACK_MAX_CHARS = 1200
+
+
+def _new_extract_meta() -> Dict[str, object]:
+    return {
+        "extract_source": "empty",
+        "raw_text_len": 0,
+        "content_len": 0,
+        "ocr_used": False,
+        "extract_timeout": False,
+    }
 
 
 def _normalize_text(text: str) -> str:
@@ -73,10 +88,10 @@ def _fitz_extract_ocr(path: Path, max_pages: int) -> str:
     doc = fitz.open(str(path))
     try:
         parts = []
-        n = min(len(doc), max_pages)
+        n = min(len(doc), max_pages, OCR_MAX_PAGES)
         for i in range(n):
             page = doc[i]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            pix = page.get_pixmap(matrix=fitz.Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE))
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             parts.append(pytesseract.image_to_string(img, lang="eng+chi_sim"))
         return _normalize_text("".join(part for part in parts if part))
@@ -87,14 +102,16 @@ def _fitz_extract_ocr(path: Path, max_pages: int) -> str:
 def run_pdf_worker_cli(argv: List[str]) -> int:
     """Run risky PyMuPDF work in an isolated child process."""
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("mode", choices=["fitz-text", "fitz-ocr"])
+    parser.add_argument("mode", choices=["pypdf-text", "fitz-text", "fitz-ocr"])
     parser.add_argument("file_path")
     parser.add_argument("max_pages", type=int)
     args = parser.parse_args(argv)
 
     try:
         path = Path(args.file_path)
-        if args.mode == "fitz-text":
+        if args.mode == "pypdf-text":
+            text = _extract_text_layer_with_pypdf(path, args.max_pages)
+        elif args.mode == "fitz-text":
             text = _fitz_extract_text_layer(path, args.max_pages)
         else:
             text = _fitz_extract_ocr(path, args.max_pages)
@@ -113,7 +130,7 @@ def _pdf_worker_command(mode: str, path: Path, max_pages: int) -> List[str]:
     return [sys.executable, str(main_script), "__pdf_worker__", mode, str(path), str(max_pages)]
 
 
-def _run_pdf_worker(mode: str, path: Path, max_pages: int) -> str:
+def _run_pdf_worker(mode: str, path: Path, max_pages: int, timeout_sec: int) -> Tuple[str, bool]:
     cmd = _pdf_worker_command(mode, path, max_pages)
 
     try:
@@ -123,35 +140,40 @@ def _run_pdf_worker(mode: str, path: Path, max_pages: int) -> str:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=PDF_WORKER_TIMEOUT_SEC,
+            timeout=timeout_sec,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+    except subprocess.TimeoutExpired:
+        return "", True
     except Exception:
-        return ""
+        return "", False
 
     if result.returncode != 0 or not result.stdout.strip():
-        return ""
+        return "", False
 
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return ""
+        return "", False
 
     if not payload.get("ok"):
-        return ""
+        return "", False
 
-    return _normalize_text(payload.get("text") or "")
+    return _normalize_text(payload.get("text") or ""), False
 
 
-def _extract_text_layer(path: Path, max_pages: int) -> str:
-    text = _extract_text_layer_with_pypdf(path, max_pages)
+def _extract_text_layer(path: Path, max_pages: int) -> Tuple[str, str, bool]:
+    text, timed_out = _run_pdf_worker("pypdf-text", path, max_pages, PYPDF_WORKER_TIMEOUT_SEC)
     if text:
-        return text
-    return _run_pdf_worker("fitz-text", path, max_pages)
+        return text, "pypdf", timed_out
+    fitz_text, fitz_timed_out = _run_pdf_worker("fitz-text", path, max_pages, FITZ_TEXT_WORKER_TIMEOUT_SEC)
+    if fitz_text:
+        return fitz_text, "fitz-text", timed_out or fitz_timed_out
+    return "", "empty", timed_out or fitz_timed_out
 
 
-def _extract_ocr_fallback(path: Path, max_pages: int) -> str:
-    return _run_pdf_worker("fitz-ocr", path, max_pages)
+def _extract_ocr_fallback(path: Path, max_pages: int) -> Tuple[str, bool]:
+    return _run_pdf_worker("fitz-ocr", path, min(max_pages, OCR_MAX_PAGES), OCR_WORKER_TIMEOUT_SEC)
 
 
 def chunk_text(
@@ -212,17 +234,51 @@ def merge_chunks_for_llm(
     return truncated.strip()
 
 
-def extract_pdf_text(path: str, max_pages: int = 10) -> str:
+def extract_pdf_text(path: str, max_pages: int = 10) -> Tuple[str, Dict[str, object]]:
     p = Path(path)
     if not p.exists():
-        return ""
+        return "", _new_extract_meta()
 
-    raw = _extract_text_layer(p, max_pages)
+    raw, source, timed_out = _extract_text_layer(p, max_pages)
+    meta = _new_extract_meta()
+    meta["extract_source"] = source
+    meta["raw_text_len"] = len(raw)
+    meta["extract_timeout"] = bool(timed_out)
     if len(raw) >= MIN_TEXT_THRESHOLD:
-        return _normalize_text(raw)
+        return _normalize_text(raw), meta
+    if len(raw) >= OCR_TRIGGER_TEXT_THRESHOLD:
+        return _normalize_text(raw), meta
 
-    ocr = _extract_ocr_fallback(p, max_pages)
-    return _normalize_text(ocr if ocr else raw)
+    ocr, ocr_timed_out = _extract_ocr_fallback(p, max_pages)
+    meta["ocr_used"] = True
+    meta["extract_timeout"] = bool(meta["extract_timeout"] or ocr_timed_out)
+    best = ocr if len(ocr) > len(raw) else raw
+    meta["extract_source"] = "ocr" if len(ocr) > len(raw) and ocr else source
+    meta["raw_text_len"] = len(best)
+    return _normalize_text(best), meta
+
+
+def _looks_like_title_noise(line: str, filename: str) -> bool:
+    if not line:
+        return True
+    lower = line.lower().strip()
+    filename_lower = filename.lower().strip()
+    noise_phrases = (
+        "full terms & conditions of access and use",
+        "full terms and conditions of access and use",
+        "downloaded by",
+        "article views",
+        "view related articles",
+        "publisher",
+        "published online",
+        "rights reserved",
+        "mathematics magazine",
+        "taylor & francis",
+        "informa uk limited",
+    )
+    if lower == filename_lower:
+        return True
+    return any(phrase in lower for phrase in noise_phrases)
 
 
 def _find_section_span(
@@ -325,11 +381,15 @@ def _extract_title_author_affiliation_abstract(full_text: str, filename: str) ->
 
     title_lines = []
     for i, line in enumerate(lines[:6]):
-        if len(line) > 10 and not line.lower().startswith(("http", "www.")):
+        if (
+            len(line) > 10
+            and not line.lower().startswith(("http", "www."))
+            and not _looks_like_title_noise(line, filename)
+        ):
             title_lines.append(line)
             if i >= 1 or len(" ".join(title_lines)) > 110:
                 break
-    title = _truncate(" ".join(title_lines), TITLE_MAX_CHARS) if title_lines else filename
+    title = _truncate(" ".join(title_lines), TITLE_MAX_CHARS) if title_lines else ""
 
     abs_start, abs_end = _find_abstract_span(text)
     abstract = ""
@@ -458,16 +518,17 @@ def extract_title_abstract_body(
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     author_section_chars: int = 800,
     **kwargs,
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str, Dict[str, object]]:
     del chunk_size, chunk_overlap, kwargs
 
     path = Path(file_path)
     if path.suffix.lower() != ".pdf":
         return path.name, "", ""
 
-    full_text = extract_pdf_text(str(path), max_pages=5)
+    full_text, meta = extract_pdf_text(str(path), max_pages=5)
     if not full_text.strip():
-        return path.name, "", ""
+        meta["content_len"] = 0
+        return "", "", meta
 
     title, author, affiliation, abstract = _extract_title_author_affiliation_abstract(full_text, path.name)
     keywords = _extract_keywords(full_text)
@@ -502,4 +563,6 @@ def extract_title_abstract_body(
     ]
 
     content = _assemble_parts(parts, max_chars_for_llm)
-    return path.name, content, ""
+    meta["raw_text_len"] = len(full_text)
+    meta["content_len"] = len(content)
+    return title, content, meta

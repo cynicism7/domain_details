@@ -1,3 +1,7 @@
+path_mapping:
+  physical_root: ""
+  logical_root: ""
+
 literature_dirs:
   - "D:/85500000解压好/libgen_scimag85501000-85501999_zip"
 

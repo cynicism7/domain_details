@@ -121,6 +121,7 @@ def ask_openai_api(
     temperature: float = 0.0,
     system_prompt: Optional[str] = None,
     stream: bool = False,
+    extra_body: Optional[dict] = None,
 ) -> str:
     """Request a chat completion from an OpenAI-compatible local API."""
     try:
@@ -132,16 +133,21 @@ def ask_openai_api(
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
+    request_kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "timeout": timeout,
+    }
+    if isinstance(extra_body, dict) and extra_body:
+        request_kwargs["extra_body"] = extra_body
 
     try:
         if stream:
             response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                timeout=timeout,
                 stream=True,
+                **request_kwargs,
             )
             buf = ""
             for chunk in response:
@@ -155,11 +161,7 @@ def ask_openai_api(
             return buf.strip()
 
         response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            timeout=timeout,
+            **request_kwargs,
         )
         message = response.choices[0].message.content if response.choices else ""
         return (message or "").strip()
@@ -177,6 +179,12 @@ DEFAULT_SYSTEM_PROMPT = """你是文献领域分类器。
 你只需要做标签选择，不需要输出推理过程。
 禁止使用 <think> 或任何思考标签，不要输出解释。
 始终只输出一行 JSON：{"field": "标签名"}。"""
+
+DEFAULT_CHOICE_SYSTEM_PROMPT = """You are a paper domain classifier.
+Choose exactly one label from the provided candidates.
+Do not output reasoning, JSON, <think>, or any extra text.
+Return only the chosen label."""
+
 
 def _get_openai_client(api_base: str, api_key: str):
     from openai import OpenAI
@@ -396,6 +404,7 @@ def _call_model(
     timeout: int,
     system_prompt: Optional[str],
     stream: bool,
+    extra_body: Optional[dict] = None,
 ) -> str:
     if provider == "openai_api":
         return ask_openai_api(
@@ -408,6 +417,7 @@ def _call_model(
             timeout=timeout,
             system_prompt=system_prompt,
             stream=stream,
+            extra_body=extra_body,
         )
     return ask_ollama(prompt, model=model, timeout=timeout, stream=stream)
 
@@ -415,6 +425,15 @@ def _call_model(
 def _build_prompt(prefix: str, content: str, system_prompt: str, max_prompt_chars: int) -> str:
     max_content = max(0, max_prompt_chars - len(system_prompt) - len(prefix))
     return prefix + _truncate_for_context(content, max_content)
+
+
+def _merge_extra_body(base: Optional[dict], override: Optional[dict]) -> Optional[dict]:
+    merged = dict(base) if isinstance(base, dict) else {}
+    if isinstance(override, dict):
+        merged.update(override)
+    return merged or None
+
+
 def _build_level1_prompt(
     title: str,
     content: str,
@@ -422,7 +441,22 @@ def _build_level1_prompt(
     system_prompt: str,
     max_prompt_chars: int,
     default_label: str,
+    response_mode: str = "json",
 ) -> str:
+    if response_mode == "label":
+        prefix = """Classify the paper into exactly one primary domain from the candidate list.
+Return only the label text and nothing else.
+Candidates:
+%s
+If uncertain, return %s.
+
+[File]
+%s
+
+[Paper]
+""" % ("\n".join(candidates), json.dumps(default_label, ensure_ascii=False), title)
+        return _build_prompt(prefix, content, system_prompt, max_prompt_chars)
+
     prefix = """判断下面文献的一级领域。
 只能从以下候选中选择一项，不允许自造标签：
 %s
@@ -445,7 +479,28 @@ def _build_level2_prompt(
     system_prompt: str,
     max_prompt_chars: int,
     default_secondary: str,
+    response_mode: str = "json",
 ) -> str:
+    if response_mode == "label":
+        prefix = """The paper is already classified into the primary domain %s.
+Choose exactly one secondary domain from the candidate list.
+Return only the label text and nothing else.
+Candidates:
+%s
+If uncertain, return %s.
+
+[File]
+%s
+
+[Paper]
+""" % (
+            json.dumps(primary, ensure_ascii=False),
+            "\n".join(candidates),
+            json.dumps(default_secondary, ensure_ascii=False),
+            title,
+        )
+        return _build_prompt(prefix, content, system_prompt, max_prompt_chars)
+
     prefix = """已知该文献的一级领域是“%s”。
 现在只在以下二级领域中选择一项，不允许自造标签：
 %s
@@ -534,9 +589,10 @@ def _resolve_with_retries(
     alias_map: Optional[Dict[str, str]],
     call_fn,
     retries: int,
+    extra_body: Optional[dict] = None,
 ) -> Optional[str]:
     for _ in range(max(0, retries) + 1):
-        raw = call_fn(prompt)
+        raw = call_fn(prompt, extra_body=extra_body)
         field = _parse_field_value(raw)
         if not field:
             continue
@@ -563,11 +619,14 @@ def _taxonomy_identify(
     taxonomy: dict,
     retries: int,
     taxonomy_fast_path: bool,
+    choice_constraints: bool,
+    extra_body: Optional[dict],
 ) -> Tuple[str, str]:
     default_label = _taxonomy_default_label(taxonomy)
     default_secondary = _taxonomy_default_secondary_label(taxonomy)
     level1_candidates = _taxonomy_level1_candidates(taxonomy)
     combined_text = title + "\n" + content
+    use_choice_constraints = provider == "openai_api" and choice_constraints
 
     title_primary = _guess_primary_from_taxonomy(title, taxonomy) if taxonomy_fast_path else None
     if title_primary and title_primary != default_label:
@@ -583,9 +642,10 @@ def _taxonomy_identify(
         system_prompt,
         max_prompt_chars,
         default_label,
+        response_mode="label" if use_choice_constraints else "json",
     )
 
-    def _call(prompt: str) -> str:
+    def _call(prompt: str, extra_body: Optional[dict] = None) -> str:
         return _call_model(
             prompt,
             provider=provider,
@@ -597,7 +657,13 @@ def _taxonomy_identify(
             timeout=timeout,
             system_prompt=system_prompt,
             stream=stream,
+            extra_body=extra_body,
         )
+
+    level1_extra_body = _merge_extra_body(
+        extra_body,
+        {"structured_outputs": {"choice": level1_candidates}} if use_choice_constraints else None,
+    )
 
     primary = title_primary
     if not primary:
@@ -607,6 +673,7 @@ def _taxonomy_identify(
             _taxonomy_primary_aliases(taxonomy),
             _call,
             retries,
+            extra_body=level1_extra_body,
         )
 
     if not primary:
@@ -624,6 +691,12 @@ def _taxonomy_identify(
         system_prompt,
         max_prompt_chars,
         default_secondary,
+        response_mode="label" if use_choice_constraints else "json",
+    )
+
+    level2_extra_body = _merge_extra_body(
+        extra_body,
+        {"structured_outputs": {"choice": level2_candidates}} if use_choice_constraints else None,
     )
 
     secondary = _guess_secondary_from_taxonomy(title, taxonomy, primary) if taxonomy_fast_path else None
@@ -634,6 +707,7 @@ def _taxonomy_identify(
             _taxonomy_secondary_aliases(taxonomy, primary),
             _call,
             retries,
+            extra_body=level2_extra_body,
         )
 
     if not secondary:
@@ -660,6 +734,8 @@ def identify_domain(
     taxonomy: Optional[dict] = None,
     retries: int = 1,
     taxonomy_fast_path: bool = True,
+    choice_constraints: bool = False,
+    extra_body: Optional[dict] = None,
 ) -> Tuple[str, str]:
     """
     Identify the best-fitting domain label for a paper.
@@ -667,7 +743,12 @@ def identify_domain(
     """
     title_s = (title or "Unknown").strip()
     content_s = (full_text or "No Content Detected").strip()
-    sys_msg = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
+    if system_prompt is not None:
+        sys_msg = system_prompt
+    elif provider == "openai_api" and choice_constraints:
+        sys_msg = DEFAULT_CHOICE_SYSTEM_PROMPT
+    else:
+        sys_msg = DEFAULT_SYSTEM_PROMPT
     cap = max_prompt_chars if max_prompt_chars is not None else DEFAULT_MAX_PROMPT_CHARS
     content_s = _truncate_for_context(content_s, max(0, cap - len(sys_msg) - 512))
 
@@ -693,6 +774,8 @@ def identify_domain(
         taxonomy=taxonomy,
         retries=retries,
         taxonomy_fast_path=taxonomy_fast_path,
+        choice_constraints=choice_constraints,
+        extra_body=extra_body,
     )
 
 
